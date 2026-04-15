@@ -1,0 +1,11 @@
+# Ignore data folders
+data/
+
+# Ignore Python cache and environments
+__pycache__/
+*.pyc
+.env
+venv/
+
+# Ignore OS generated files
+.DS_Store
