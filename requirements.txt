@@ -1,0 +1,16 @@
+# Data Manipulation & Analysis
+pandas==2.2.1
+numpy==1.26.4
+
+# Optimization & Fairness Algorithms
+pulp==2.8.0
+scipy==1.12.0
+cvxpy==1.4.2
+
+# Data Visualization (Pareto Frontiers, Heatmaps)
+matplotlib==3.8.3
+seaborn==0.13.2
+
+# Jupyter Environment (For your exploration notebooks)
+notebook==7.1.2
+ipykernel==6.29.3
