@@ -5,6 +5,7 @@ Skeleton-only version: implementation intentionally left as TODOs.
 """
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import matplotlib.pyplot as plt
@@ -15,17 +16,35 @@ import pulp
 # ============================================================================
 # 1. DATA STRUCTURES & INPUTS
 # ============================================================================
+INTERVENTION_TYPES = ["stunting", "wasting", "severe_wasting"]
 
+COUNT_COLS = {
+    "stunting":       "Count_Stunting",
+    "wasting":        "Count_Wasting",
+    "severe_wasting": "Count_Severe_Wasting",
+}
+COST_COLS = {
+    "stunting":       "Cost_stunting",
+    "wasting":        "Cost_wasting",
+    "severe_wasting": "Cost_severe_wasting",
+}
 
 @dataclass
 class AllocationProblem:
-    """Container for the optimization problem definition."""
-
-    data: pd.DataFrame
+    df: pd.DataFrame
     total_budget: float
-    metrics: List[str] = field(
-        default_factory=lambda: ["stunting", "wasting", "severe_wasting"]
-    )
+    countries: Optional[List[str]] = None
+    demographic_filter: Optional[List[str]] = None
+    filtered_df: pd.DataFrame = field(init=False, repr=False)
+
+    def __post_init__(self):
+        df = self.df.copy()
+        if self.countries:
+            df = df[df["ISO3"].isin(self.countries)]
+        if self.demographic_filter:
+            df = df[df["Demographic_Group"].isin(self.demographic_filter)]
+        self.filtered_df = df.reset_index(drop=True)
+
 
 
 @dataclass
@@ -53,7 +72,7 @@ class StakeholderProfile:
 
 class UtilitarianOptimizer:
     """
-    Standard LP baseline.
+    Standard LP baseline using PuLP with HiGHS solver.
 
     Goal:
         maximize total treated children
@@ -68,28 +87,95 @@ class UtilitarianOptimizer:
         self.allocation_vars = {}
 
     def setup_variables(self):
-        """TODO: create decision variables for each country/demographic/metric."""
-        pass
+        """Create one LpVariable per (row, intervention).
+        upBound = available children → encodes capacity without a separate constraint."""
+        df = self.problem.filtered_df
+        for i, row in df.iterrows():
+            self.allocation_vars[i] = {
+                itype: pulp.LpVariable(
+                    name=f"x_{i}_{itype}",
+                    lowBound=0,
+                    upBound=float(row[COUNT_COLS[itype]]),
+                    cat=pulp.LpContinuous,
+                )
+                for itype in INTERVENTION_TYPES
+            }
 
     def add_objective(self):
-        """TODO: maximize total treated children (or weighted treated children)."""
-        pass
+        """Maximize total treated children (unweighted sum across all rows and interventions)."""
+        self.model += pulp.lpSum(
+            self.allocation_vars[i][itype]
+            for i in self.allocation_vars
+            for itype in INTERVENTION_TYPES
+        ), "Total_Treated_Children"
 
     def add_budget_constraint(self):
-        """TODO: enforce sum(spend) <= total_budget."""
-        pass
+        """Enforce sum(x[i,t] * cost[i,t]) <= total_budget."""
+        df = self.problem.filtered_df
+        self.model += (
+            pulp.lpSum(
+                self.allocation_vars[i][itype] * float(df.loc[i, COST_COLS[itype]])
+                for i in self.allocation_vars
+                for itype in INTERVENTION_TYPES
+            )
+            <= self.problem.total_budget,
+            "Global_Budget",
+        )
 
     def solve(self) -> Dict:
-        """Run optimization and return structured solution."""
+        """Run optimization using PuLP with HiGHS solver and return structured solution."""
         self.setup_variables()
         self.add_objective()
         self.add_budget_constraint()
-        self.model.solve(pulp.PULP_CBC_CMD(msg=0))
+        
+        # Solve using HiGHS solver
+        self.model.solve(pulp.HiGHS(msg=0))
+        
         return self._extract_solution()
 
     def _extract_solution(self) -> Dict:
-        """TODO: convert solver output to dictionary/DataFrame payload."""
-        pass
+        """Convert solver output to a summary dict + per-row allocation DataFrame."""
+        df = self.problem.filtered_df
+        rows = []
+        for i, base_row in df.iterrows():
+            record = base_row[["ISO3", "Country", "Demographic_Group"]].to_dict()
+            for itype in INTERVENTION_TYPES:
+                treated = pulp.value(self.allocation_vars[i][itype]) or 0.0
+                record[f"treated_{itype}"] = treated
+                record[f"spend_{itype}"] = treated * float(df.loc[i, COST_COLS[itype]])
+            record["total_treated"] = sum(record[f"treated_{t}"] for t in INTERVENTION_TYPES)
+            record["total_spend"] = sum(record[f"spend_{t}"] for t in INTERVENTION_TYPES)
+            rows.append(record)
+
+        allocation_df = pd.DataFrame(rows)
+        total_spend = allocation_df["total_spend"].sum()
+
+        return {
+            "status": pulp.LpStatus[self.model.status],
+            "total_treated": pulp.value(self.model.objective) or 0.0,
+            "total_spend": total_spend,
+            "budget": self.problem.total_budget,
+            "budget_utilisation_pct": 100 * total_spend / self.problem.total_budget if self.problem.total_budget > 0 else 0,
+            "allocation_df": allocation_df,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Quick demo
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    data_path = Path(__file__).parent.parent / "data" / "processed" / "master_df_with_counts_and_costs.csv"
+    df = pd.read_csv(data_path)
+
+    problem = AllocationProblem(df=df, total_budget=10_000_000, countries=["AFG"])
+    solution = UtilitarianOptimizer(problem).solve()
+
+    print(f"Status            : {solution['status']}")
+    print(f"Total treated     : {solution['total_treated']:,.0f}")
+    print(f"Total spend       : ${solution['total_spend']:,.0f}")
+    print(f"Budget utilisation: {solution['budget_utilisation_pct']:.1f}%")
+    print(solution["allocation_df"][["Country","Demographic_Group","total_treated","total_spend"]])
+
 
 
 # ============================================================================
