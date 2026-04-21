@@ -211,7 +211,8 @@ class PreferenceElicitor:
         q1_min_share = 0.20
     """
 
-    ALLOWED_FAIRNESS_MODES = {"utilitarian", "weighted-log", "max-min", "proportional"}
+    # ALLOWED_FAIRNESS_MODES = {"utilitarian", "weighted-log", "max-min", "proportional"}
+    ALLOWED_FAIRNESS_MODES = {"utilitarian", "max-min", "proportional"}
 
     def __init__(
         self,
@@ -434,7 +435,6 @@ class FairnessOptimizer:
 
     Expected modes:
       - utilitarian
-      - weighted-log (proxy if staying LP)
       - max-min fairness
       - proportional fairness
     """
@@ -446,51 +446,100 @@ class FairnessOptimizer:
         self.allocation_vars = {}
 
     def setup_variables(self):
-        data = self.problem.data 
+        data = self.problem.df
         data = data[:20] # ONLY AFGHANISTAN, TO REMOVE
 
-        for index, row in data.iterrows():
+        for _, row in data.iterrows():
             for idx, metric in enumerate(["stunting", "wasting", "severe_wasting"]):
-                # self.allocation_vars[f"{row.iloc[0]}_{row.iloc[2]}_{metric}"] = pulp.LpVariable(f"{row.iloc[0]}_{row.iloc[2]}_{metric}", lowBound=0, upBound=row.iloc[7 + idx] * row.iloc[10 + idx], cat='continuous')
-                self.allocation_vars[(index, metric)] = pulp.LpVariable(f"{row.iloc[0]}_{row.iloc[2]}_{metric}", lowBound=0, upBound=row.iloc[7 + idx] * row.iloc[10 + idx], cat='continuous')
-
-    def add_weighted_log_objective(self):
-        """TODO: add weighted-log objective (or LP-compatible approximation)."""
-        pass
+                self.allocation_vars[(row['ISO3'], row['Demographic_Group'], metric)] = pulp.LpVariable(f"{row['ISO3']}_{row.iloc['Demographic_Group']}_{metric}", lowBound=0, upBound=row.iloc[7 + idx] * row.iloc[10 + idx], cat='continuous')
 
     def add_max_min_fairness(self):
-        """TODO: add max-min constraints/objective."""
-        pass
+        min_coverage = pulp.LpVariable("min_coverage", lowBound=0, cat=pulp.LpContinuous)
+    
+        for iso3, group in self.problem.df.groupby("ISO3"):
+            burden = sum([ 
+                float(pd.to_numeric(group.at[0, "Population_U5"], errors="coerce")) * self.preferences.metric_weights[metric] 
+                for metric in INTERVENTION_TYPES 
+            ])
+
+            # ​coverage_g = ∑i∈{g,m}​​ (x{i,m}​​​/c{i,m})
+
+            self.model += pulp.lpSum([ 
+                self.allocation_vars[(iso3, "National", metric)] / # 2 is the index of "National" row in the dataset (hence also the index of its variable)
+                (1 / float(pd.to_numeric(group["Demographic_Group" == "National"][f"Count_{metric}"])))
+                for metric in INTERVENTION_TYPES
+            ]) >= min_coverage * burden # coverage_g >= z * burden_g 
 
     def add_proportional_fairness(self):
-        """TODO: constrain allocation proportional to burden shares."""
-        pass
+        countries_burden = {}
+        for iso3, group in self.problem.df.groupby("ISO3"):
+            countries_burden[iso3] = sum([ 
+                float(pd.to_numeric(group.at[0, "Population_U5"], errors="coerce")) * self.preferences.metric_weights[metric] 
+                for metric in INTERVENTION_TYPES 
+            ])
+
+        for iso3, burden in countries_burden.items():
+            self.model += pulp.lpSum([
+                self.allocation_vars[(iso3, group, metric)]
+                for (iso3, group, metric) in self.allocation_vars
+            ]) >= burden * self.problem.total_budget, "Proportional_fairness"
 
     def add_demographic_constraints(self):
-        """TODO: apply stakeholder constraints (e.g., rural_minimum)."""
-        pass
+        '''
+            Constraint convention used here:
+            demographic_constraints = {
+                "rural_min_share": 0.40,
+                "urban_max_share": 0.60,
+                "female_min_share": 0.45,
+                "male_max_share": 0.55,
+                "poorest_quintile_min_share": 0.25,
+            }
+
+            Each key follows the pattern:
+                <group_value>_<min|max>_share
+        '''
+
+        for (constraint, value) in self.preferences.demographic_constraints.items():
+            group, boundType = constraint.split("_")[:2] # "rural_min_share" -> ["rural", "min"]
+            constrained_vars = { key: var for (key, var) in self.allocation_vars.items() if group.lower() == str(key[1]).lower() }
+
+            if boundType == "min": 
+                self.model += pulp.lpSum([
+                    constrained_vars[(iso3, g, metric)] * 
+                    float(pd.to_numeric(self.problem.df.at[g, f"Cost_{metric}"], errors="coerce"))
+                    for (iso3, g, metric) in constrained_vars
+                ]) >= value * self.problem.total_budget
+            else:
+                self.model += pulp.lpSum([
+                    constrained_vars[(iso3, g, metric)] * 
+                    float(pd.to_numeric(self.problem.df.at[g, f"Cost_{metric}"], errors="coerce"))
+                    for (iso3, g, metric) in constrained_vars
+                ]) <= value * self.problem.total_budget
+
 
     def solve(self) -> Dict:
         """Dispatch by fairness mode and return solution payload."""
         self.setup_variables()
-        self.model += pulp.lpSum(self.allocation_vars.values()) <= self.problem.total_budget
+        self.model += pulp.lpSum([
+            self.allocation_vars[(iso3, group, metric)] * 
+            float(pd.to_numeric(self.problem.df.at[group, f"Cost_{metric}"], errors="coerce"))
+            for (iso3, group, metric) in self.allocation_vars
+        ]) <= self.problem.total_budget
 
         if self.preferences.fairness_mode == "utilitarian":
             self.model += pulp.lpSum([
-                self.allocation_vars[(i, metric)] * 
-                (1 / float(pd.to_numeric(self.problem.data.at[i, f"Cost_{metric}"], errors="coerce"))) *
+                self.allocation_vars[(iso3, group, metric)] * 
+                (1 / float(pd.to_numeric(self.problem.df.at[group, f"Cost_{metric}"], errors="coerce"))) *
                 self.preferences.metric_weights[metric]
-                for (i, metric) in self.allocation_vars
+                for (iso3, group, metric) in self.allocation_vars
             ]), "Total_Treated_Children"
-        elif self.preferences.fairness_mode == "weighted-log":
-            self.add_weighted_log_objective()
         elif self.preferences.fairness_mode == "max-min":
             self.add_max_min_fairness()
         elif self.preferences.fairness_mode == "proportional":
             self.add_proportional_fairness()
 
         self.add_demographic_constraints()
-        self.model.solve(pulp.PULP_CBC_CMD(msg=0))
+        self.model.solve(pulp.PULP_CBC_CMD(msg=False))
         return self._extract_solution()
 
     def _extract_solution(self) -> Dict:
