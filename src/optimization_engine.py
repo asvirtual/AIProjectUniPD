@@ -116,7 +116,7 @@ class UtilitarianOptimizer:
         df = self.problem.filtered_df
         self.model += (
             pulp.lpSum(
-                self.allocation_vars[i][itype] * float(df.at[i, COST_COLS[itype]])  # type: ignore
+                self.allocation_vars[i][itype] * float(pd.to_numeric(df.at[i, COST_COLS[itype]], errors="coerce"))
                 for i in self.allocation_vars
                 for itype in INTERVENTION_TYPES
             )
@@ -144,7 +144,7 @@ class UtilitarianOptimizer:
             for itype in INTERVENTION_TYPES:
                 treated = pulp.value(self.allocation_vars[i][itype]) or 0.0
                 record[f"treated_{itype}"] = treated
-                record[f"spend_{itype}"] = treated * float(df.at[i, COST_COLS[itype]])  # type: ignore
+                record[f"spend_{itype}"] = treated * float(pd.to_numeric(df.at[i, COST_COLS[itype]], errors="coerce"))
             record["total_treated"] = sum(record[f"treated_{t}"] for t in INTERVENTION_TYPES)
             record["total_spend"] = sum(record[f"spend_{t}"] for t in INTERVENTION_TYPES)
             rows.append(record)
