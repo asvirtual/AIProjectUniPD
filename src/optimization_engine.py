@@ -7,7 +7,6 @@ Skeleton-only version: implementation intentionally left as TODOs.
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
 from typing import Any, Dict, List, Optional
 
 import matplotlib.pyplot as plt
@@ -87,46 +86,54 @@ class UtilitarianOptimizer:
         self.problem = problem
         self.model = pulp.LpProblem("Utilitarian_Allocation", pulp.LpMaximize)
         self.allocation_vars = {}
+        self.cost_map = {}  # Pre-computed cost lookup: (iso3, demographic_group, itype) → cost
+
+    def _build_cost_map(self):
+        """Pre-compute cost mapping to avoid repeated DataFrame lookups."""
+        df = self.problem.filtered_df
+        for row in df.to_dict('records'):
+            iso3 = row["ISO3"]
+            demographic_group = row["Demographic_Group"]
+            for itype in INTERVENTION_TYPES:
+                key = (iso3, demographic_group, itype)
+                self.cost_map[key] = float(pd.to_numeric(row[COST_COLS[itype]], errors="coerce"))
 
     def setup_variables(self):
-        """Create one LpVariable per (row, intervention).
+        """Create one LpVariable per (iso3, demographic_group, intervention).
+        Key structure: (iso3, demographic_group, itype) → LpVariable
         upBound = available children → encodes capacity without a separate constraint."""
         df = self.problem.filtered_df
-        for i, row in df.iterrows():
-            self.allocation_vars[i] = {
-                itype: pulp.LpVariable(
-                    name=f"x_{i}_{itype}",
+        for row in df.to_dict('records'):
+            iso3 = row["ISO3"]
+            demographic_group = row["Demographic_Group"]
+            for itype in INTERVENTION_TYPES:
+                key = (iso3, demographic_group, itype)
+                self.allocation_vars[key] = pulp.LpVariable(
+                    name=f"x_{iso3}_{demographic_group}_{itype}",
                     lowBound=0,
                     upBound=float(row[COUNT_COLS[itype]]),
                     cat=pulp.LpContinuous,
                 )
-                for itype in INTERVENTION_TYPES
-            }
 
     def add_objective(self):
-        """Maximize total treated children (unweighted sum across all rows and interventions)."""
+        """Maximize total treated children (unweighted sum across all allocation variables)."""
         self.model += pulp.lpSum(
-            self.allocation_vars[i][itype]
-            for i in self.allocation_vars
-            for itype in INTERVENTION_TYPES
+            self.allocation_vars[key]
+            for key in self.allocation_vars
         ), "Total_Treated_Children"
 
     def add_budget_constraint(self):
-        """Enforce sum(x[i,t] * cost[i,t]) <= total_budget."""
-        df = self.problem.filtered_df
-        self.model += (
-            pulp.lpSum(
-                self.allocation_vars[i][itype] * float(pd.to_numeric(df.at[i, COST_COLS[itype]], errors="coerce"))
-                for i in self.allocation_vars
-                for itype in INTERVENTION_TYPES
-            )
-            <= self.problem.total_budget,
-            "Global_Budget",
+        """Enforce sum(x[key] * cost[key]) <= total_budget."""
+        constraint_expr = pulp.lpSum(
+            self.allocation_vars[key] * self.cost_map[key]
+            for key in self.allocation_vars
         )
+        self.model += constraint_expr <= self.problem.total_budget, "Global_Budget"
 
     def solve(self) -> Dict:
         """Run optimization using PuLP with HiGHS solver and return structured solution."""
         self.setup_variables()
+        self._build_cost_map()  # Pre-compute costs before building constraints
         self.add_objective()
         self.add_budget_constraint()
         
@@ -139,12 +146,17 @@ class UtilitarianOptimizer:
         """Convert solver output to a summary dict + per-row allocation DataFrame."""
         df = self.problem.filtered_df
         rows = []
-        for i, base_row in df.iterrows():
-            record = base_row[["ISO3", "Country", "Demographic_Group"]].to_dict()
+        for base_row in df.to_dict('records'):
+            iso3 = base_row["ISO3"]
+            demographic_group = base_row["Demographic_Group"]
+            record = {"ISO3": base_row["ISO3"], "Country": base_row["Country"], "Demographic_Group": base_row["Demographic_Group"]}
+            
             for itype in INTERVENTION_TYPES:
-                treated = pulp.value(self.allocation_vars[i][itype]) or 0.0
+                key = (iso3, demographic_group, itype)
+                treated = pulp.value(self.allocation_vars[key]) or 0.0
                 record[f"treated_{itype}"] = treated
-                record[f"spend_{itype}"] = treated * float(pd.to_numeric(df.at[i, COST_COLS[itype]], errors="coerce"))
+                record[f"spend_{itype}"] = treated * self.cost_map[key]
+            
             record["total_treated"] = sum(record[f"treated_{t}"] for t in INTERVENTION_TYPES)
             record["total_spend"] = sum(record[f"spend_{t}"] for t in INTERVENTION_TYPES)
             rows.append(record)
@@ -162,6 +174,102 @@ class UtilitarianOptimizer:
         }
 
 
+class ConstrainedUtilitarianOptimizer(UtilitarianOptimizer):
+    """
+    Constrained utilitarian optimizer with equity budget caps and minimum allocations.
+
+    Goal:
+        maximize total treated children (same as UtilitarianOptimizer)
+    Subject to:
+        global budget constraint
+        country-level budget caps (e.g., no country gets >60% of budget)
+        demographic-level budget caps (optional)
+        demographic-level minimum allocations (optional, e.g., rural must get >=30%)
+        non-negative allocation variables
+
+    This prevents greedy allocation while still maximizing efficiency.
+    """
+
+    def __init__(
+        self,
+        problem: AllocationProblem,
+        country_cap: float = 0.5,
+        demographic_cap: Optional[float] = None,
+        demographic_min_share: Optional[Dict[str, float]] = None,
+    ):
+        """
+        Parameters:
+            problem: AllocationProblem instance
+            country_cap: Maximum fraction of total budget per country (default 0.5 = 50%)
+            demographic_cap: Maximum fraction of total budget per demographic group (optional)
+            demographic_min_share: Dict of {demographic_group: min_fraction} constraints.
+                                 E.g., {"Rural": 0.30} means rural must get >=30% of budget
+        """
+        super().__init__(problem)
+        self.country_cap = country_cap
+        self.demographic_cap = demographic_cap
+        self.demographic_min_share = demographic_min_share or {}
+        self.model = pulp.LpProblem("Constrained_Utilitarian_Allocation", pulp.LpMaximize)
+
+    def add_country_budget_caps(self):
+        """Enforce per-country budget cap: sum(spend by country) <= cap * total_budget."""
+        df = self.problem.filtered_df
+        # Pre-compute mapping from iso3 to country
+        iso3_to_country = df[["ISO3", "Country"]].drop_duplicates().set_index("ISO3")["Country"].to_dict()
+        
+        for country in df["Country"].unique():
+            country_vars = [key for key in self.allocation_vars if iso3_to_country.get(key[0]) == country]
+            
+            if country_vars:
+                constraint_expr = pulp.lpSum(
+                    self.allocation_vars[key] * self.cost_map[key]
+                    for key in country_vars
+                )
+                self.model += constraint_expr <= self.country_cap * self.problem.total_budget, f"Country_Cap_{country}"
+
+    def add_demographic_budget_caps(self):
+        """Enforce per-demographic budget cap: sum(spend by demographic) <= cap * total_budget."""
+        if self.demographic_cap is None:
+            return
+        
+        for demographic in self.problem.filtered_df["Demographic_Group"].unique():
+            demographic_vars = [key for key in self.allocation_vars if key[1] == demographic]
+            
+            if demographic_vars:
+                constraint_expr = pulp.lpSum(
+                    self.allocation_vars[key] * self.cost_map[key]
+                    for key in demographic_vars
+                )
+                self.model += constraint_expr <= self.demographic_cap * self.problem.total_budget, f"Demographic_Cap_{demographic}"
+
+    def add_demographic_minimum_constraints(self):
+        """Enforce per-demographic minimum: sum(spend by demographic) >= min_share * total_budget."""
+        for demographic, min_share in self.demographic_min_share.items():
+            demographic_vars = [key for key in self.allocation_vars if key[1] == demographic]
+            
+            if demographic_vars:
+                constraint_expr = pulp.lpSum(
+                    self.allocation_vars[key] * self.cost_map[key]
+                    for key in demographic_vars
+                )
+                self.model += constraint_expr >= min_share * self.problem.total_budget, f"Demographic_Min_{demographic}"
+
+    def solve(self) -> Dict:
+        """Run constrained optimization with budget caps and demographic constraints."""
+        self.setup_variables()
+        self._build_cost_map()  # Pre-compute costs before building constraints
+        self.add_objective()
+        self.add_budget_constraint()
+        self.add_country_budget_caps()
+        self.add_demographic_budget_caps()
+        self.add_demographic_minimum_constraints()
+        
+        # Solve using HiGHS solver
+        self.model.solve(pulp.HiGHS(msg=False))
+        
+        return self._extract_solution()
+
+
 # ---------------------------------------------------------------------------
 # Quick demo
 # ---------------------------------------------------------------------------
@@ -169,14 +277,149 @@ if __name__ == "__main__":
     data_path = Path(__file__).parent.parent / "data" / "processed" / "master_df_with_counts_and_costs.csv"
     df = pd.read_csv(data_path)
 
-    problem = AllocationProblem(df=df, total_budget=10_000_000, countries=["AFG"])
-    solution = UtilitarianOptimizer(problem).solve()
-
-    print(f"Status            : {solution['status']}")
-    print(f"Total treated     : {solution['total_treated']:,.0f}")
-    print(f"Total spend       : ${solution['total_spend']:,.0f}")
-    print(f"Budget utilisation: {solution['budget_utilisation_pct']:.1f}%")
-    print(solution["allocation_df"][["Country","Demographic_Group","total_treated","total_spend"]])
+    # Use all countries in the dataset
+    problem = AllocationProblem(df=df, total_budget=10_000_000)
+    print(f"Testing with {df['Country'].nunique()} countries\n")
+    print(df.groupby("Country")[["Cost_stunting", "Cost_wasting", "Cost_severe_wasting"]].mean())
+    print(df.head(10))
+    print(df.columns)
+    print(df[['Country', 'Count_Stunting', 'Cost_stunting', 'Count_Wasting', 'Cost_wasting']].head())
+    
+    # Run baseline utilitarian (no constraints)
+    print("=" * 70)
+    print("BASELINE UTILITARIAN OPTIMIZER (No Constraints)")
+    print("=" * 70)
+    solution_baseline = UtilitarianOptimizer(problem).solve()
+    
+    print(f"Status            : {solution_baseline['status']}")
+    print(f"Total treated     : {solution_baseline['total_treated']:,.0f}")
+    print(f"Total spend       : ${solution_baseline['total_spend']:,.0f}")
+    print(f"Budget utilisation: {solution_baseline['budget_utilisation_pct']:.1f}%")
+    
+    print("\n--- Summary by Country ---")
+    by_country_baseline = solution_baseline["allocation_df"].groupby("Country").agg({
+        "total_treated": "sum",
+        "total_spend": "sum"
+    }).reset_index()
+    by_country_baseline["pct_spend"] = 100 * by_country_baseline["total_spend"] / solution_baseline["total_spend"]
+    by_country_baseline["cost_per_child"] = by_country_baseline["total_spend"] / by_country_baseline["total_treated"]
+    by_country_baseline = by_country_baseline.sort_values("total_spend", ascending=False)
+    print(by_country_baseline[["Country", "total_treated", "total_spend", "pct_spend", "cost_per_child"]].head(10).to_string(index=False))
+    
+    # Run constrained utilitarian (10% cap per country - very tight for visible tradeoff)
+    print("\n" + "=" * 70)
+    print("CONSTRAINED UTILITARIAN OPTIMIZER (10% Budget Cap per Country)")
+    print("=" * 70)
+    solution_constrained = ConstrainedUtilitarianOptimizer(problem, country_cap=0.1).solve()
+    
+    print(f"Status            : {solution_constrained['status']}")
+    print(f"Total treated     : {solution_constrained['total_treated']:,.0f}")
+    print(f"Total spend       : ${solution_constrained['total_spend']:,.0f}")
+    print(f"Budget utilisation: {solution_constrained['budget_utilisation_pct']:.1f}%")
+    
+    print("\n--- Summary by Country ---")
+    by_country_constrained = solution_constrained["allocation_df"].groupby("Country").agg({
+        "total_treated": "sum",
+        "total_spend": "sum"
+    }).reset_index()
+    by_country_constrained["pct_spend"] = 100 * by_country_constrained["total_spend"] / solution_constrained["total_spend"]
+    by_country_constrained["cost_per_child"] = by_country_constrained["total_spend"] / by_country_constrained["total_treated"]
+    by_country_constrained = by_country_constrained.sort_values("total_spend", ascending=False)
+    print(by_country_constrained[["Country", "total_treated", "total_spend", "pct_spend", "cost_per_child"]].to_string(index=False))
+    
+    # Run with demographic minimum constraint (Rural >= 30%)
+    print("\n" + "=" * 70)
+    print("CONSTRAINED UTILITARIAN + DEMOGRAPHIC MINIMUM (Rural >= 30%, 10% Country Cap)")
+    print("=" * 70)
+    solution_demographic_constrained = ConstrainedUtilitarianOptimizer(
+        problem, 
+        country_cap=0.1,
+        demographic_min_share={"Rural": 0.30}
+    ).solve()
+    
+    print(f"Status            : {solution_demographic_constrained['status']}")
+    print(f"Total treated     : {solution_demographic_constrained['total_treated']:,.0f}")
+    print(f"Total spend       : ${solution_demographic_constrained['total_spend']:,.0f}")
+    print(f"Budget utilisation: {solution_demographic_constrained['budget_utilisation_pct']:.1f}%")
+    
+    print("\n--- Allocation by Demographic Group ---")
+    by_demographic = solution_demographic_constrained["allocation_df"].groupby("Demographic_Group").agg({
+        "total_treated": "sum",
+        "total_spend": "sum"
+    }).reset_index()
+    by_demographic["pct_spend"] = 100 * by_demographic["total_spend"] / solution_demographic_constrained["total_spend"]
+    by_demographic["cost_per_child"] = by_demographic["total_spend"] / by_demographic["total_treated"]
+    by_demographic = by_demographic.sort_values("total_spend", ascending=False)
+    print(by_demographic.to_string(index=False))
+    
+    # Comparison
+    print("\n" + "=" * 70)
+    print("COMPARISON: Country-only Caps vs. Country + Demographic Minimum")
+    print("=" * 70)
+    efficiency_loss_demographic = solution_constrained["total_treated"] - solution_demographic_constrained["total_treated"]
+    efficiency_loss_demographic_pct = 100 * efficiency_loss_demographic / solution_constrained["total_treated"]
+    print(f"Efficiency loss (children not treated): {efficiency_loss_demographic:,.0f} ({efficiency_loss_demographic_pct:.1f}%)")
+    print(f"\nCountry-only caps: {solution_constrained['total_treated']:,.0f} children treated")
+    print(f"With rural minimum: {solution_demographic_constrained['total_treated']:,.0f} children treated")
+    print(f"\nNote: Forcing allocation to Rural (higher-cost demographic) reduces overall efficiency.")
+    
+    # Overall comparison
+    print("\n" + "=" * 70)
+    print("OVERALL COMPARISON: All Three Scenarios")
+    print("=" * 70)
+    baseline_loss = solution_baseline["total_treated"] - solution_constrained["total_treated"]
+    demographic_loss = solution_constrained["total_treated"] - solution_demographic_constrained["total_treated"]
+    total_loss = solution_baseline["total_treated"] - solution_demographic_constrained["total_treated"]
+    
+    print(f"Baseline (no constraints)              : {solution_baseline['total_treated']:>12,.0f} children")
+    print(f"Country-level constraints              : {solution_constrained['total_treated']:>12,.0f} children (loss: {baseline_loss:>8,.0f})")
+    print(f"Country + Demographic constraints      : {solution_demographic_constrained['total_treated']:>12,.0f} children (loss: {total_loss:>8,.0f})")
+    print(f"\nCost of fairness constraints:")
+    print(f"  Country redistribution alone         : {100*baseline_loss/solution_baseline['total_treated']:.2f}%")
+    print(f"  Additional demographic constraint    : {100*demographic_loss/solution_constrained['total_treated']:.2f}%")
+    
+    # Debug: check if constraints are actually binding
+    print("\n" + "=" * 70)
+    print("DEBUG: Constraint Analysis")
+    print("=" * 70)
+    print(f"Baseline budget utilisation: {solution_baseline['budget_utilisation_pct']:.1f}%")
+    print(f"Constrained budget utilisation: {solution_constrained['budget_utilisation_pct']:.1f}%")
+    print("\nBaseline - Max country spend as % of total:")
+    print(by_country_baseline[["Country", "pct_spend"]].sort_values("pct_spend", ascending=False).head(3).to_string(index=False))
+    print("\nConstrained - Max country spend as % of total:")
+    print(by_country_constrained[["Country", "pct_spend"]].sort_values("pct_spend", ascending=False).head(3).to_string(index=False))
+    
+    # Check cost efficiency by demographic
+    print("\n" + "=" * 70)
+    print("DEMOGRAPHIC COST ANALYSIS")
+    print("=" * 70)
+    
+    print("\nBaseline allocation by demographic (top 5):")
+    dem_baseline = solution_baseline["allocation_df"].groupby("Demographic_Group").agg({
+        "total_treated": "sum",
+        "total_spend": "sum"
+    }).reset_index()
+    dem_baseline["cost_per_child"] = dem_baseline["total_spend"] / dem_baseline["total_treated"]
+    dem_baseline = dem_baseline.sort_values("total_spend", ascending=False)
+    print(dem_baseline[["Demographic_Group", "total_treated", "cost_per_child"]].head(5).to_string(index=False))
+    
+    print("\nConstrained allocation by demographic (top 5):")
+    dem_constrained = solution_constrained["allocation_df"].groupby("Demographic_Group").agg({
+        "total_treated": "sum",
+        "total_spend": "sum"
+    }).reset_index()
+    dem_constrained["cost_per_child"] = dem_constrained["total_spend"] / dem_constrained["total_treated"]
+    dem_constrained = dem_constrained.sort_values("total_spend", ascending=False)
+    print(dem_constrained[["Demographic_Group", "total_treated", "cost_per_child"]].head(5).to_string(index=False))
+    
+    print("\nWith Rural >=30% minimum:")
+    dem_demographic = solution_demographic_constrained["allocation_df"].groupby("Demographic_Group").agg({
+        "total_treated": "sum",
+        "total_spend": "sum"
+    }).reset_index()
+    dem_demographic["cost_per_child"] = dem_demographic["total_spend"] / dem_demographic["total_treated"]
+    dem_demographic = dem_demographic.sort_values("total_spend", ascending=False)
+    print(dem_demographic[dem_demographic["total_spend"] > 0][["Demographic_Group", "total_treated", "cost_per_child"]].to_string(index=False))
 
 
 # ============================================================================
