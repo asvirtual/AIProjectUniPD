@@ -151,8 +151,13 @@ class FairnessOptimizer:
         self.allocation_vars = {}
 
     def setup_variables(self):
-        """TODO: create allocation decision variables."""
-        pass
+        data = self.problem.data 
+        data = data[:20] # ONLY AFGHANISTAN, TO REMOVE
+
+        for index, row in data.iterrows():
+            for idx, metric in enumerate(["stunting", "wasting", "severe_wasting"]):
+                # self.allocation_vars[f"{row.iloc[0]}_{row.iloc[2]}_{metric}"] = pulp.LpVariable(f"{row.iloc[0]}_{row.iloc[2]}_{metric}", lowBound=0, upBound=row.iloc[7 + idx] * row.iloc[10 + idx], cat='continuous')
+                self.allocation_vars[(index, metric)] = pulp.LpVariable(f"{row.iloc[0]}_{row.iloc[2]}_{metric}", lowBound=0, upBound=row.iloc[7 + idx] * row.iloc[10 + idx], cat='continuous')
 
     def add_weighted_log_objective(self):
         """TODO: add weighted-log objective (or LP-compatible approximation)."""
@@ -173,10 +178,15 @@ class FairnessOptimizer:
     def solve(self) -> Dict:
         """Dispatch by fairness mode and return solution payload."""
         self.setup_variables()
+        self.model += pulp.lpSum(self.allocation_vars.values()) <= self.problem.total_budget
 
         if self.preferences.fairness_mode == "utilitarian":
-            # TODO: set utilitarian objective
-            pass
+            self.model += pulp.lpSum([
+                self.allocation_vars[(i, metric)] * 
+                (1 / float(pd.to_numeric(self.problem.data.at[i, f"Cost_{metric}"], errors="coerce"))) *
+                self.preferences.metric_weights[metric]
+                for (i, metric) in self.allocation_vars
+            ]), "Total_Treated_Children"
         elif self.preferences.fairness_mode == "weighted-log":
             self.add_weighted_log_objective()
         elif self.preferences.fairness_mode == "max-min":
