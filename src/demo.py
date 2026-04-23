@@ -14,11 +14,11 @@ from optimization_engine import AllocationProblem, UtilitarianOptimizer, Constra
 
 def main():
     # Load data
-    data_path = Path(__file__).parent.parent / "data" / "processed" / "master_df_with_counts_and_costs.csv"
+    data_path = Path(__file__).parent.parent / "data" / "processed" / "master_df_mece_compliant.csv"
     df = pd.read_csv(data_path)
 
     # Use all countries in the dataset
-    problem = AllocationProblem(df=df, total_budget=10_000_000)
+    problem = AllocationProblem(df=df, total_budget=100_000_000)
     print(f"Testing with {df['Country'].nunique()} countries\n")
 
     # ========================================================================
@@ -93,7 +93,7 @@ def main():
     print(f"Budget utilisation: {solution_demographic_constrained['budget_utilisation_pct']:.1f}%")
     
     print("\n--- Allocation by Demographic Group ---")
-    by_demographic = solution_demographic_constrained["allocation_df"].groupby("Demographic_Group").agg({
+    by_demographic = solution_demographic_constrained["allocation_df"].groupby("Demographic_group").agg({
         "total_treated": "sum",
         "total_spend": "sum"
     }).reset_index()
