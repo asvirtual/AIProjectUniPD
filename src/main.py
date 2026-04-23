@@ -17,7 +17,7 @@ Steps:
 """
 
 engine = AllocationEngine(
-    data_path="../data/processed/master_df_with_counts_and_costs.csv",
+    data_path="../data/processed/master_df_mece_compliant.csv",
     total_budget=100_000_000,  # $100 million global budget
 )
 

@@ -271,21 +271,6 @@ class ConstrainedUtilitarianOptimizer(UtilitarianOptimizer):
         
         return self._extract_solution()
 
-    def solve(self) -> Dict:
-        """Run constrained optimization with budget caps and demographic constraints."""
-        self.setup_variables()
-        self._build_cost_map()  # Pre-compute costs before building constraints
-        self.add_objective()
-        self.add_budget_constraint()
-        self.add_country_budget_caps()
-        self.add_demographic_budget_caps()
-        self.add_demographic_minimum_constraints()
-        
-        # Solve using HiGHS solver
-        self.model.solve(pulp.HiGHS(msg=False))
-        
-        return self._extract_solution()
-
 
 
 
@@ -561,30 +546,44 @@ class FairnessOptimizer:
 
         for index, row in data.iterrows():
             for idx, metric in enumerate(INTERVENTION_TYPES):
-                # self.allocation_vars[(index, row['ISO3'], row['Demographic_Group'], metric)] = pulp.LpVariable(f"{row['ISO3']}_{row.at['Demographic_Group']}_{metric}", lowBound=0, upBound=row.iloc[7 + idx] * row.iloc[10 + idx], cat='continuous')
-                self.allocation_vars[(index, row['ISO3'], row['Demographic_Group'], metric)] = pulp.LpVariable(f"{row['ISO3']}_{row.at['Demographic_Group']}_{metric}", lowBound=0, upBound=row.at[f"Count_{metric}"], cat='continuous')
+                # self.allocation_vars[(index, row['ISO3'], row['Demographic_group'], metric)] = pulp.LpVariable(f"{row['ISO3']}_{row.at['Demographic_group']}_{metric}", lowBound=0, upBound=row.iloc[7 + idx] * row.iloc[10 + idx], cat='continuous')
+                self.allocation_vars[(index, row['ISO3'], row['Demographic_group'], metric)] = pulp.LpVariable(f"{row['ISO3']}_{row.at['Demographic_group']}_{metric}", lowBound=0, upBound=row.at[f"Count_{metric}"], cat='continuous')
 
     def add_max_min_fairness(self):
+        """Maximize the minimum country-level coverage ratio.
+
+        Coverage is defined as total treated in a country divided by total need
+        in that country. This avoids relying on a specific demographic label like
+        'National', which can make the model unbounded if that row is absent.
+        """
         min_coverage = pulp.LpVariable("min_coverage", lowBound=0, cat=pulp.LpContinuous)
         self.model += min_coverage, "Maximize_Min_Coverage"
 
-        for iso3, group in self.problem.df.groupby("ISO3"):
-            burden = sum([ 
-                float(pd.to_numeric(group.iloc[0]["Population_U5"], errors="coerce")) * self.preferences.metric_weights[metric] 
-                for metric in INTERVENTION_TYPES 
-            ])
+        working_df = self.problem.filtered_df
+        added_constraint = False
 
-            # ​coverage_g = ∑i∈{g,m}​​ (x{i,m}​​​/c{i,m})
-
-            national_rows = group[group["Demographic_Group"].str.lower() == "national"]
-            if national_rows.empty: continue
-            national_idx = national_rows.index[0]
-
-            self.model += pulp.lpSum([ 
-                self.allocation_vars[(national_idx, iso3, "National", metric)] # *
-                # (1 / float(pd.to_numeric(group["Demographic_Group" == "National"][f"Count_{metric}"])))
+        for iso3, group in working_df.groupby("ISO3"):
+            country_need = 0.0
+            country_treated_expr = pulp.lpSum(
+                self.allocation_vars[(idx, row["ISO3"], row["Demographic_group"], metric)]
+                for idx, row in group.iterrows()
                 for metric in INTERVENTION_TYPES
-            ]) >= min_coverage * burden # coverage_g >= z * burden_g 
+            )
+
+            for _, row in group.iterrows():
+                for metric in INTERVENTION_TYPES:
+                    country_need += float(pd.to_numeric(row[COUNT_COLS[metric]], errors="coerce") or 0.0)
+
+            if country_need <= 0:
+                continue
+
+            self.model += (
+                country_treated_expr >= min_coverage * country_need
+            ), f"Min_Coverage_{iso3}"
+            added_constraint = True
+
+        if not added_constraint:
+            raise ValueError("No valid country-level need found for max-min fairness optimization.")
 
     def add_proportional_fairness(self):
         # Keep utilitarian-style objective.
@@ -597,7 +596,7 @@ class FairnessOptimizer:
         countries_burden = {}
         for iso3, group in self.problem.df.groupby("ISO3"):
             burden = sum(
-                float(pd.to_numeric(group.iloc[0]["Population_U5"], errors="coerce") or 0.0)
+                float(pd.to_numeric(group.iloc[0]["Population_u5"], errors="coerce") or 0.0)
                 * float(self.preferences.metric_weights[metric])
                 for metric in INTERVENTION_TYPES
             )
@@ -696,22 +695,22 @@ class FairnessOptimizer:
         """
         Convert solver output to:
           - aggregate summary
-          - per (ISO3, Demographic_Group) allocation DataFrame
+          - per (ISO3, Demographic_group) allocation DataFrame
         """
         df = self.problem.filtered_df.copy()
     
-        # Build quick lookup for Country and costs by (ISO3, Demographic_Group, metric)
+        # Build quick lookup for Country and costs by (ISO3, Demographic_group, metric)
         country_lookup = (
-            df[["ISO3", "Demographic_Group", "Country"]]
+            df[["ISO3", "Demographic_group", "Country"]]
             .drop_duplicates()
-            .set_index(["ISO3", "Demographic_Group"])["Country"]
+            .set_index(["ISO3", "Demographic_group"])["Country"]
             .to_dict()
         )
     
         cost_lookup = {}
         for row in df.to_dict("records"):
             iso3 = row["ISO3"]
-            demo = row["Demographic_Group"]
+            demo = row["Demographic_group"]
             for metric in INTERVENTION_TYPES:
                 cost_lookup[(iso3, demo, metric)] = float(
                     pd.to_numeric(row[COST_COLS[metric]], errors="coerce")
@@ -729,7 +728,7 @@ class FairnessOptimizer:
                 records[key] = {
                     "ISO3": iso3,
                     "Country": country_lookup.get((iso3, demo), None),
-                    "Demographic_Group": demo,
+                    "Demographic_group": demo,
                     "total_treated": 0.0,
                     "total_spend": 0.0,
                 }
@@ -746,7 +745,7 @@ class FairnessOptimizer:
         if allocation_df.empty:
             allocation_df = pd.DataFrame(
                 columns=[
-                    "ISO3", "Country", "Demographic_Group",
+                    "ISO3", "Country", "Demographic_group",
                     "treated_stunting", "treated_wasting", "treated_severe_wasting",
                     "spend_stunting", "spend_wasting", "spend_severe_wasting",
                     "total_treated", "total_spend",
@@ -777,7 +776,7 @@ class FairnessOptimizer:
 class FairnessMetrics:
     """Metrics and comparison helpers for baseline vs fairness allocations."""
 
-    KEY_COLS = ["ISO3", "Country", "Demographic_Group"]
+    KEY_COLS = ["ISO3", "Country", "Demographic_group"]
 
     @staticmethod
     def _allocation_df(allocation: Dict) -> pd.DataFrame:
@@ -886,7 +885,7 @@ class FairnessMetrics:
     def demographic_coverage_gap(
         allocation: Dict,
         problem: AllocationProblem,
-        group_col: str = "Demographic_Group",
+        group_col: str = "Demographic_group",
     ) -> Dict[str, Any]:
         """
         Per ogni paese, misura il gap di copertura tra gruppi demografici.
@@ -961,7 +960,7 @@ class FairnessMetrics:
     def demographic_parity_violation(
         allocation: Dict,
         problem: AllocationProblem,
-        group_col: str = "Demographic_Group",
+        group_col: str = "Demographic_group",
     ) -> float:
         """
         Misura quanto la distribuzione di copertura per gruppo demografico
@@ -1042,7 +1041,7 @@ class FairnessMetrics:
         return float(0.5 * (spend_share - burden_share).abs().sum())
 
     @staticmethod
-    def build_summary(allocation: Dict, problem: AllocationProblem, label: str = "solution") -> Dict[str, float]:
+    def build_summary(allocation: Dict, problem: AllocationProblem, label: str = "solution") -> Dict[str, Any]:
         """Return a compact metric summary for one allocation result."""
         return {
             "label": label,
@@ -1181,8 +1180,51 @@ class AllocationEngine:
         return fair_solution
 
     def aggregate_preferences(self, stakeholders: List[StakeholderProfile]) -> StakeholderPreferences:
-        """TODO: aggregate multiple stakeholder preferences into one consensus profile."""
-        pass
+        """Aggregate stakeholder preferences with influence-weighted averaging."""
+        if not stakeholders:
+            raise ValueError("stakeholders must contain at least one StakeholderProfile.")
+
+        total_influence = float(sum(max(float(stakeholder.influence), 0.0) for stakeholder in stakeholders))
+        if total_influence <= 0:
+            total_influence = float(len(stakeholders))
+
+        metric_totals: Dict[str, float] = {}
+        constraint_totals: Dict[str, float] = {}
+        fairness_mode_votes: Dict[str, float] = {}
+
+        for stakeholder in stakeholders:
+            weight = max(float(stakeholder.influence), 0.0)
+            if weight == 0:
+                continue
+
+            fairness_mode_votes[stakeholder.preferences.fairness_mode] = (
+                fairness_mode_votes.get(stakeholder.preferences.fairness_mode, 0.0) + weight
+            )
+
+            for metric, value in stakeholder.preferences.metric_weights.items():
+                metric_totals[metric] = metric_totals.get(metric, 0.0) + weight * float(value)
+
+            for key, value in stakeholder.preferences.demographic_constraints.items():
+                constraint_totals[key] = constraint_totals.get(key, 0.0) + weight * float(value)
+
+        metric_weights = {
+            metric: total / total_influence for metric, total in metric_totals.items()
+        }
+        demographic_constraints = {
+            key: total / total_influence for key, total in constraint_totals.items()
+        }
+
+        fairness_mode = (
+            max(fairness_mode_votes.items(), key=lambda item: item[1])[0]
+            if fairness_mode_votes
+            else "utilitarian"
+        )
+
+        return StakeholderPreferences(
+            metric_weights=metric_weights,
+            demographic_constraints=demographic_constraints,
+            fairness_mode=fairness_mode,
+        )
 
     def run_fairness_simulations(
         self,
