@@ -18,7 +18,7 @@ def main():
     df = pd.read_csv(data_path)
 
     # Use all countries in the dataset
-    problem = AllocationProblem(df=df, total_budget=10_000_000)
+    problem = AllocationProblem(df=df, total_budget=100_000_000)
     print(f"Testing with {df['Country'].nunique()} countries\n")
 
     # ========================================================================
