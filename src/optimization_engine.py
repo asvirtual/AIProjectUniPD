@@ -547,7 +547,7 @@ class FairnessOptimizer:
         for index, row in data.iterrows():
             for idx, metric in enumerate(INTERVENTION_TYPES):
                 # self.allocation_vars[(index, row['ISO3'], row['Demographic_Group'], metric)] = pulp.LpVariable(f"{row['ISO3']}_{row.at['Demographic_Group']}_{metric}", lowBound=0, upBound=row.iloc[7 + idx] * row.iloc[10 + idx], cat='continuous')
-                self.allocation_vars[(index, row['ISO3'], row['Demographic_Group'], metric)] = pulp.LpVariable(f"{row['ISO3']}_{row.at['Demographic_Group']}_{metric}", lowBound=0, upBound=row.iloc[7 + idx], cat='continuous')
+                self.allocation_vars[(index, row['ISO3'], row['Demographic_Group'], metric)] = pulp.LpVariable(f"{row['ISO3']}_{row.at['Demographic_Group']}_{metric}", lowBound=0, upBound=row.at[f"Count_{metric}"], cat='continuous')
 
     def add_max_min_fairness(self):
         min_coverage = pulp.LpVariable("min_coverage", lowBound=0, cat=pulp.LpContinuous)
