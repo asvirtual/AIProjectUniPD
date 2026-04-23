@@ -554,7 +554,7 @@ class FairnessOptimizer:
         self.allocation_vars = {}
 
     def setup_variables(self):
-        data = self.problem.df
+        data = self.problem.filtered_df
         # data = data[:20] # TODO: ONLY AFGHANISTAN, TO REMOVE
 
         for index, row in data.iterrows():
@@ -563,40 +563,39 @@ class FairnessOptimizer:
                 self.allocation_vars[(index, row['ISO3'], row['Demographic_group'], metric)] = pulp.LpVariable(f"{row['ISO3']}_{row.at['Demographic_group']}_{metric}", lowBound=0, upBound=row.at[f"Count_{metric}"], cat='continuous')
 
     def add_max_min_fairness(self):
-        """Maximize the minimum country-level coverage ratio.
+        """Maximize the minimum treated-share across all filtered rows.
 
-        Coverage is defined as total treated in a country divided by total need
-        in that country. This avoids relying on a specific demographic label like
-        'National', which can make the model unbounded if that row is absent.
+        Each row represents a country/demographic segment. We constrain the
+        treated total in every row to be at least min_coverage times that row's
+        total need. This is the most stable max-min formulation for this data
+        shape and avoids depending on special labels like 'National'.
         """
-        min_coverage = pulp.LpVariable("min_coverage", lowBound=0, cat=pulp.LpContinuous)
-        self.model += min_coverage, "Maximize_Min_Coverage"
+        min_coverage = pulp.LpVariable("min_coverage", lowBound=0, upBound=1, cat=pulp.LpContinuous)
 
         working_df = self.problem.filtered_df
         added_constraint = False
 
-        for iso3, group in working_df.groupby("ISO3"):
-            country_need = 0.0
-            country_treated_expr = pulp.lpSum(
-                self.allocation_vars[(idx, row["ISO3"], row["Demographic_group"], metric)]
-                for idx, row in group.iterrows()
+        for idx, row in working_df.iterrows():
+            row_need = sum(
+                float(pd.to_numeric(row[COUNT_COLS[metric]], errors="coerce") or 0.0)
                 for metric in INTERVENTION_TYPES
             )
 
-            for _, row in group.iterrows():
-                for metric in INTERVENTION_TYPES:
-                    country_need += float(pd.to_numeric(row[COUNT_COLS[metric]], errors="coerce") or 0.0)
-
-            if country_need <= 0:
+            if row_need <= 0:
                 continue
 
-            self.model += (
-                country_treated_expr >= min_coverage * country_need
-            ), f"Min_Coverage_{iso3}"
+            row_treated_expr = pulp.lpSum(
+                self.allocation_vars[(idx, row["ISO3"], row["Demographic_group"], metric)]
+                for metric in INTERVENTION_TYPES
+            )
+
+            self.model += row_treated_expr >= min_coverage * row_need, f"Min_Coverage_{idx}"
             added_constraint = True
 
         if not added_constraint:
-            raise ValueError("No valid country-level need found for max-min fairness optimization.")
+            raise ValueError("No valid positive-need rows found for max-min fairness optimization.")
+
+        self.model.setObjective(min_coverage)
 
     def add_proportional_fairness(self):
         # Keep utilitarian-style objective.
@@ -607,7 +606,7 @@ class FairnessOptimizer:
     
         # Build normalized country burden shares.
         countries_burden = {}
-        for iso3, group in self.problem.df.groupby("ISO3"):
+        for iso3, group in self.problem.filtered_df.groupby("ISO3"):
             burden = sum(
                 float(pd.to_numeric(group.iloc[0]["Population_u5"], errors="coerce") or 0.0)
                 * float(self.preferences.metric_weights[metric])
@@ -626,7 +625,7 @@ class FairnessOptimizer:
         for iso3, burden_share in countries_burden.items():
             country_spend_expr = pulp.lpSum(
                 self.allocation_vars[(idx, var_iso3, demo, metric)] *
-                float(pd.to_numeric(self.problem.df.at[idx, COST_COLS[metric]], errors="coerce") or 0.0)
+                float(pd.to_numeric(self.problem.filtered_df.at[idx, COST_COLS[metric]], errors="coerce") or 0.0)
                 for (idx, var_iso3, demo, metric) in self.allocation_vars
                 if var_iso3 == iso3
             )
@@ -661,7 +660,7 @@ class FairnessOptimizer:
 
             constrained_keys = [
                 key for key in self.allocation_vars
-                if str(key[2]).lower() == group_value
+                if group_value in str(key[2]).lower()
             ]
 
             # If no matching demographic rows exist, skip instead of creating impossible constraints.
@@ -685,7 +684,7 @@ class FairnessOptimizer:
 
         self.model += pulp.lpSum([
             self.allocation_vars[(index, iso3, group, metric)] * 
-            float(pd.to_numeric(self.problem.df.at[index, f"Cost_{metric}"], errors="coerce"))
+            float(pd.to_numeric(self.problem.filtered_df.at[index, f"Cost_{metric}"], errors="coerce"))
             for (index, iso3, group, metric) in self.allocation_vars
         ]) <= self.problem.total_budget, "Max_Budget"
 
@@ -701,7 +700,12 @@ class FairnessOptimizer:
             self.add_proportional_fairness()
 
         self.add_demographic_constraints()
-        self.model.solve(pulp.HiGHS(msg=False))
+        solver = (
+            pulp.PULP_CBC_CMD(msg=False)
+            if self.preferences.fairness_mode == "max-min"
+            else pulp.HiGHS(msg=False)
+        )
+        self.model.solve(solver)
         return self._extract_solution()
 
     def _extract_solution(self) -> Dict:
