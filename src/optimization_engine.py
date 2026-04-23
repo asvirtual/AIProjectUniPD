@@ -139,8 +139,7 @@ class UtilitarianOptimizer:
         self.add_budget_constraint()
         
         # Solve using HiGHS solver
-        # self.model.solve(pulp.HiGHS(msg=False))
-        self.model.solve(pulp.PULP_CBC_CMD(msg=False))
+        self.model.solve(pulp.HiGHS(msg=False))
         
         return self._extract_solution()
 
@@ -245,16 +244,30 @@ class ConstrainedUtilitarianOptimizer(UtilitarianOptimizer):
                 self.model += constraint_expr <= self.demographic_cap * self.problem.total_budget, f"Demographic_Cap_{demographic}"
 
     def add_demographic_minimum_constraints(self):
-        """Enforce per-demographic minimum: sum(spend by demographic) >= min_share * total_budget."""
-        for demographic, min_share in self.demographic_min_share.items():
-            demographic_vars = [key for key in self.allocation_vars if key[1] == demographic]
+        """Enforce per-demographic minimum: sum(spend by demographic group) >= min_share * total_budget.
+        
+        Supports pattern matching: constraint keys can be:
+        - Exact group name: "Wealth Quintile 1 Rural" (matches only that group)
+        - Substring pattern: "Rural" (matches all groups containing "Rural")
+        - Wealth quintile: "Wealth Quintile 1" (matches all Q1 groups: Q1 Rural + Q1 Urban)
+        """
+        for demographic_pattern, min_share in self.demographic_min_share.items():
+            # Find all allocation variables matching this pattern
+            demographic_vars = [
+                key for key in self.allocation_vars 
+                if demographic_pattern in key[1]  # key[1] is the demographic_group
+            ]
             
             if demographic_vars:
                 constraint_expr = pulp.lpSum(
                     self.allocation_vars[key] * self.cost_map[key]
                     for key in demographic_vars
                 )
-                self.model += constraint_expr >= min_share * self.problem.total_budget, f"Demographic_Min_{demographic}"
+                self.model += constraint_expr >= min_share * self.problem.total_budget, f"Demographic_Min_{demographic_pattern}"
+            else:
+                print(f"⚠️ Warning: No demographic groups found matching pattern '{demographic_pattern}'")
+                print(f"   Available groups: {sorted(set(key[1] for key in self.allocation_vars))}")
+
 
     def solve(self) -> Dict:
         """Run constrained optimization with budget caps and demographic constraints."""
@@ -689,7 +702,7 @@ class FairnessOptimizer:
             self.add_proportional_fairness()
 
         self.add_demographic_constraints()
-        self.model.solve(pulp.PULP_CBC_CMD(msg=False))
+        self.model.solve(pulp.HiGHS(msg=False))
         return self._extract_solution()
 
     def _extract_solution(self) -> Dict:
