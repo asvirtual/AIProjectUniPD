@@ -27,7 +27,7 @@ print("✓ Baseline solution computed")
 
 preferences = StakeholderPreferences(
     metric_weights={"stunting": 1.0, "wasting": 1.0, "severe_wasting": 1.5},
-    demographic_constraints={"rural_minimum": 0.2},
+    demographic_constraints={"rural_min_share": 0.2},
     fairness_mode="proportional",
 )
 
@@ -41,7 +41,7 @@ stakeholders = [
         influence=0.4,
         preferences=StakeholderPreferences(
             metric_weights={"stunting": 0.8, "wasting": 1.0, "severe_wasting": 1.6},
-            demographic_constraints={"rural_minimum": 0.15},
+            demographic_constraints={"rural_min_share": 0.15},
             fairness_mode="utilitarian",
         ),
     ),
@@ -50,7 +50,7 @@ stakeholders = [
         influence=0.35,
         preferences=StakeholderPreferences(
             metric_weights={"stunting": 1.0, "wasting": 1.0, "severe_wasting": 1.2},
-            demographic_constraints={"rural_minimum": 0.4},
+            demographic_constraints={"rural_min_share": 0.4},
             fairness_mode="max-min",
         ),
     ),
@@ -67,6 +67,26 @@ stakeholders = [
 
 sim_results = engine.run_fairness_simulations(stakeholders, include_consensus=True)
 print(f"✓ Ran {len(sim_results)} stakeholder simulations (including consensus)")
+for (idx, res) in sim_results.items():
+    print(f"\n--- Simulation: {idx} ---")
+    print(f"Status            : {res['status']}")
+    print(f"Total treated     : {res['total_treated']:,.0f}")
+    print(f"Total spend       : ${res['total_spend']:,.0f}")
+    print(f"Budget utilisation: {res['budget_utilisation_pct']:.1f}%")
+
+    print("\n--- Summary by Country ---")
+    by_country_baseline = res["allocation_df"].groupby("Country").agg({
+        "total_treated": "sum",
+        "total_spend": "sum"
+    }).reset_index()
+    by_country_baseline["pct_spend"] = 100 * by_country_baseline["total_spend"] / res["total_spend"]
+    by_country_baseline["cost_per_child"] = by_country_baseline["total_spend"] / by_country_baseline["total_treated"]
+    by_country_baseline = by_country_baseline.sort_values("total_spend", ascending=False)
+    print(by_country_baseline[["Country", "total_treated", "total_spend", "pct_spend", "cost_per_child"]].head(10).to_string(index=False))
+
+
+
+
 
 consensus = sim_results.get("consensus")
 if consensus:
