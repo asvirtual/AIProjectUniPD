@@ -73,8 +73,8 @@ def main():
     # ========================================================================
     country_cap_demographic = 0.20
     demographic_min_constraints = {
-        "Rural": 0.40,
-        "Wealth Quintile 1": 0.20
+        "Rural": 0.40,                # Minimum 40% to all groups containing "Rural"
+        "Wealth Quintile 1": 0.20     # Minimum 20% to all Q1 groups (both Rural and Urban)
     }
     constraint_str = ", ".join([f"{k} >= {100*v:.0f}%" for k, v in demographic_min_constraints.items()])
     print("\n" + "=" * 70)

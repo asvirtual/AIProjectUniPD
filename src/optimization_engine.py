@@ -139,8 +139,7 @@ class UtilitarianOptimizer:
         self.add_budget_constraint()
         
         # Solve using HiGHS solver
-        # self.model.solve(pulp.HiGHS(msg=False))
-        self.model.solve(pulp.PULP_CBC_CMD(msg=False))
+        self.model.solve(pulp.HiGHS(msg=False))
         
         return self._extract_solution()
 
@@ -245,16 +244,30 @@ class ConstrainedUtilitarianOptimizer(UtilitarianOptimizer):
                 self.model += constraint_expr <= self.demographic_cap * self.problem.total_budget, f"Demographic_Cap_{demographic}"
 
     def add_demographic_minimum_constraints(self):
-        """Enforce per-demographic minimum: sum(spend by demographic) >= min_share * total_budget."""
-        for demographic, min_share in self.demographic_min_share.items():
-            demographic_vars = [key for key in self.allocation_vars if key[1] == demographic]
+        """Enforce per-demographic minimum: sum(spend by demographic group) >= min_share * total_budget.
+        
+        Supports pattern matching: constraint keys can be:
+        - Exact group name: "Wealth Quintile 1 Rural" (matches only that group)
+        - Substring pattern: "Rural" (matches all groups containing "Rural")
+        - Wealth quintile: "Wealth Quintile 1" (matches all Q1 groups: Q1 Rural + Q1 Urban)
+        """
+        for demographic_pattern, min_share in self.demographic_min_share.items():
+            # Find all allocation variables matching this pattern
+            demographic_vars = [
+                key for key in self.allocation_vars 
+                if demographic_pattern in key[1]  # key[1] is the demographic_group
+            ]
             
             if demographic_vars:
                 constraint_expr = pulp.lpSum(
                     self.allocation_vars[key] * self.cost_map[key]
                     for key in demographic_vars
                 )
-                self.model += constraint_expr >= min_share * self.problem.total_budget, f"Demographic_Min_{demographic}"
+                self.model += constraint_expr >= min_share * self.problem.total_budget, f"Demographic_Min_{demographic_pattern}"
+            else:
+                print(f"⚠️ Warning: No demographic groups found matching pattern '{demographic_pattern}'")
+                print(f"   Available groups: {sorted(set(key[1] for key in self.allocation_vars))}")
+
 
     def solve(self) -> Dict:
         """Run constrained optimization with budget caps and demographic constraints."""
@@ -688,7 +701,7 @@ class FairnessOptimizer:
             self.add_proportional_fairness()
 
         self.add_demographic_constraints()
-        self.model.solve(pulp.PULP_CBC_CMD(msg=False))
+        self.model.solve(pulp.HiGHS(msg=False))
         return self._extract_solution()
 
     def _extract_solution(self) -> Dict:
@@ -778,6 +791,10 @@ class FairnessMetrics:
 
     KEY_COLS = ["ISO3", "Country", "Demographic_group"]
 
+    # Validate the optimizer output and return its allocation DataFrame.
+    # Input: allocation result dict.
+    # Output: a non-empty copy of allocation_df.
+    # Purpose: ensure downstream metrics always work on a valid allocation table.
     @staticmethod
     def _allocation_df(allocation: Dict) -> pd.DataFrame:
         if not isinstance(allocation, dict):
@@ -789,6 +806,10 @@ class FairnessMetrics:
             raise ValueError("allocation_df is empty.")
         return allocation_df.copy()
 
+    # Validate the original problem data and return the filtered base DataFrame.
+    # Input: AllocationProblem instance.
+    # Output: a non-empty copy of problem.filtered_df.
+    # Purpose: provide the reference data needed to evaluate an allocation.
     @staticmethod
     def _base_problem_df(problem: AllocationProblem) -> pd.DataFrame:
         if not hasattr(problem, "filtered_df"):
@@ -798,6 +819,10 @@ class FairnessMetrics:
             raise ValueError("problem.filtered_df is empty.")
         return base_df
 
+    # Build the main evaluation view by merging base data with allocation results.
+    # Input: optimizer result dict + AllocationProblem.
+    # Output: merged DataFrame with need, treated, spend, and coverage ratio.
+    # Purpose: create the common table used by most fairness metrics.
     @classmethod
     def _merged_allocation_view(cls, allocation: Dict, problem: AllocationProblem) -> pd.DataFrame:
         allocation_df = cls._allocation_df(allocation)
@@ -833,6 +858,10 @@ class FairnessMetrics:
         )
         return merged
 
+    # Compute the Gini coefficient of a list of non-negative values.
+    # Input: numeric list, typically coverage ratios.
+    # Output: inequality score from 0 (equal) upward.
+    # Purpose: summarize how unevenly benefits are distributed.
     @staticmethod
     def _gini(values: List[float]) -> float:
         clean = [float(v) for v in values if pd.notna(v)]
@@ -849,6 +878,10 @@ class FairnessMetrics:
         weighted_sum = sum((idx + 1) * val for idx, val in enumerate(sorted_vals))
         return (2 * weighted_sum) / (n * total) - (n + 1) / n
 
+    # Measure total efficiency as the number of children treated overall.
+    # Input: allocation result dict.
+    # Output: total treated across all rows.
+    # Purpose: quantify the aggregate impact of the solution.
     @staticmethod
     def total_lives_impacted(allocation: Dict, problem: AllocationProblem) -> float:
         """Efficiency metric: total treated children across all rows."""
@@ -857,12 +890,20 @@ class FairnessMetrics:
             raise ValueError("allocation_df must contain a 'total_treated' column.")
         return float(pd.to_numeric(allocation_df["total_treated"], errors="coerce").fillna(0.0).sum())
 
+    # Measure inequality in achieved coverage across rows.
+    # Input: allocation result dict + AllocationProblem.
+    # Output: Gini coefficient on coverage ratios.
+    # Purpose: check whether coverage is distributed evenly or not.
     @staticmethod
     def gini_coefficient(allocation: Dict, problem: AllocationProblem) -> float:
         """Inequality of achieved coverage across rows (0 = perfectly equal coverage)."""
         merged = FairnessMetrics._merged_allocation_view(allocation, problem)
         return float(FairnessMetrics._gini(merged["coverage_ratio"].tolist()))
 
+    # Compare the best-served and worst-served groups in terms of coverage.
+    # Input: allocation result dict + AllocationProblem.
+    # Output: max coverage divided by min coverage.
+    # Purpose: capture worst-case disparity in a simple fairness indicator.
     @staticmethod
     def max_min_ratio(allocation: Dict, problem: AllocationProblem) -> float:
         """Best-off / worst-off achieved coverage ratio across rows with positive need."""
@@ -880,6 +921,10 @@ class FairnessMetrics:
             return float("inf")
         return max_cov / min_cov
     
+    # Measure within-country coverage gaps between demographic groups.
+    # Input: allocation result dict + AllocationProblem.
+    # Output: per-country gap details and mean gap summaries.
+    # Purpose: detect whether some demographic groups are systematically underserved.
     """ !!! non passato ne risultati, da valtare come chiamarlo se interessa   """
     @staticmethod
     def demographic_coverage_gap(
@@ -955,6 +1000,10 @@ class FairnessMetrics:
             "unweighted_mean_gap": unweighted_mean,
         }
 
+    # Compare observed demographic coverage with the ideal burden-based distribution.
+    # Input: allocation result dict + AllocationProblem.
+    # Output: violation score between 0 and 1.
+    # Purpose: measure how far treatment distribution departs from demographic need.
     """ !!! passato nei risultati, da valtare se interessa   """
     @staticmethod
     def demographic_parity_violation(
@@ -1020,6 +1069,10 @@ class FairnessMetrics:
 
         return float(sum(v * w for v, w in zip(violations, weights)) / total_weight)
 
+    # Compare budget shares with need shares across the allocation.
+    # Input: allocation result dict + AllocationProblem.
+    # Output: total variation distance between spend and burden distributions.
+    # Purpose: assess whether money follows need proportionally.
     @staticmethod
     def proportionality_violation(allocation: Dict, problem: AllocationProblem) -> float:
         """
@@ -1040,6 +1093,10 @@ class FairnessMetrics:
         spend_share = merged["total_spend"] / total_spend
         return float(0.5 * (spend_share - burden_share).abs().sum())
 
+    # Build a compact summary of the main efficiency and fairness metrics.
+    # Input: allocation result dict + AllocationProblem.
+    # Output: dictionary of key evaluation indicators for one solution.
+    # Purpose: make a single allocation easy to inspect and report.
     @staticmethod
     def build_summary(allocation: Dict, problem: AllocationProblem, label: str = "solution") -> Dict[str, Any]:
         """Return a compact metric summary for one allocation result."""
@@ -1048,13 +1105,17 @@ class FairnessMetrics:
             "status": allocation.get("status", "UNKNOWN"),
             "total_lives_impacted": FairnessMetrics.total_lives_impacted(allocation, problem),
             "total_spend": float(allocation.get("total_spend", 0.0) or 0.0),
-            "demographic_parity_violation": FairnessMetrics.demographic_parity_violation(allocation, problem), """messo io assieme agli altri cosi"""
             "budget_utilisation_pct": float(allocation.get("budget_utilisation_pct", 0.0) or 0.0),
             "gini_coefficient": FairnessMetrics.gini_coefficient(allocation, problem),
             "max_min_ratio": FairnessMetrics.max_min_ratio(allocation, problem),
+            "demographic_parity_violation": FairnessMetrics.demographic_parity_violation(allocation, problem),
             "proportionality_violation": FairnessMetrics.proportionality_violation(allocation, problem),
         }
 
+    # Compare baseline and fairness-aware solutions side by side.
+    # Input: two allocation result dicts + AllocationProblem.
+    # Output: summaries, comparison table, and price of fairness.
+    # Purpose: quantify the trade-off between efficiency and equity.
     @staticmethod
     def compare_allocations(
         baseline: Dict,
