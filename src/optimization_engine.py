@@ -21,9 +21,9 @@ import pulp
 INTERVENTION_TYPES = ["stunting", "wasting", "severe_wasting"]
 
 COUNT_COLS = {
-    "stunting":       "Count_Stunting",
-    "wasting":        "Count_Wasting",
-    "severe_wasting": "Count_Severe_Wasting",
+    "stunting":       "Count_stunting",
+    "wasting":        "Count_wasting",
+    "severe_wasting": "Count_severe_wasting",
 }
 COST_COLS = {
     "stunting":       "Cost_stunting",
@@ -44,7 +44,7 @@ class AllocationProblem:
         if self.countries:
             df = df[df["ISO3"].isin(self.countries)]
         if self.demographic_filter:
-            df = df[df["Demographic_Group"].isin(self.demographic_filter)]
+            df = df[df["Demographic_group"].isin(self.demographic_filter)]
         self.filtered_df = df.reset_index(drop=True)
 
 
@@ -94,7 +94,7 @@ class UtilitarianOptimizer:
         df = self.problem.filtered_df
         for row in df.to_dict('records'):
             iso3 = row["ISO3"]
-            demographic_group = row["Demographic_Group"]
+            demographic_group = row["Demographic_group"]
             for itype in INTERVENTION_TYPES:
                 key = (iso3, demographic_group, itype)
                 self.cost_map[key] = float(pd.to_numeric(row[COST_COLS[itype]], errors="coerce"))
@@ -106,7 +106,7 @@ class UtilitarianOptimizer:
         df = self.problem.filtered_df
         for row in df.to_dict('records'):
             iso3 = row["ISO3"]
-            demographic_group = row["Demographic_Group"]
+            demographic_group = row["Demographic_group"]
             for itype in INTERVENTION_TYPES:
                 key = (iso3, demographic_group, itype)
                 self.allocation_vars[key] = pulp.LpVariable(
@@ -149,8 +149,8 @@ class UtilitarianOptimizer:
         rows = []
         for base_row in df.to_dict('records'):
             iso3 = base_row["ISO3"]
-            demographic_group = base_row["Demographic_Group"]
-            record = {"ISO3": base_row["ISO3"], "Country": base_row["Country"], "Demographic_Group": base_row["Demographic_Group"]}
+            demographic_group = base_row["Demographic_group"]
+            record = {"ISO3": base_row["ISO3"], "Country": base_row["Country"], "Demographic_group": base_row["Demographic_group"]}
             
             for itype in INTERVENTION_TYPES:
                 key = (iso3, demographic_group, itype)
@@ -233,7 +233,7 @@ class ConstrainedUtilitarianOptimizer(UtilitarianOptimizer):
         if self.demographic_cap is None:
             return
         
-        for demographic in self.problem.filtered_df["Demographic_Group"].unique():
+        for demographic in self.problem.filtered_df["Demographic_group"].unique():
             demographic_vars = [key for key in self.allocation_vars if key[1] == demographic]
             
             if demographic_vars:
@@ -254,6 +254,21 @@ class ConstrainedUtilitarianOptimizer(UtilitarianOptimizer):
                     for key in demographic_vars
                 )
                 self.model += constraint_expr >= min_share * self.problem.total_budget, f"Demographic_Min_{demographic}"
+
+    def solve(self) -> Dict:
+        """Run constrained optimization with budget caps and demographic constraints."""
+        self.setup_variables()
+        self._build_cost_map()  # Pre-compute costs before building constraints
+        self.add_objective()
+        self.add_budget_constraint()
+        self.add_country_budget_caps()
+        self.add_demographic_budget_caps()
+        self.add_demographic_minimum_constraints()
+        
+        # Solve using HiGHS solver
+        self.model.solve(pulp.HiGHS(msg=False))
+        
+        return self._extract_solution()
 
     def solve(self) -> Dict:
         """Run constrained optimization with budget caps and demographic constraints."""
@@ -552,7 +567,7 @@ class FairnessOptimizer:
     
         for iso3, group in self.problem.df.groupby("ISO3"):
             burden = sum([ 
-                float(pd.to_numeric(group.at[0, "Population_U5"], errors="coerce")) * self.preferences.metric_weights[metric] 
+                float(pd.to_numeric(group.at[0, "Population_u5"], errors="coerce")) * self.preferences.metric_weights[metric] 
                 for metric in INTERVENTION_TYPES 
             ])
 
@@ -560,7 +575,7 @@ class FairnessOptimizer:
 
             self.model += pulp.lpSum([ 
                 self.allocation_vars[(iso3, "National", metric)] / # 2 is the index of "National" row in the dataset (hence also the index of its variable)
-                (1 / float(pd.to_numeric(group["Demographic_Group" == "National"][f"Count_{metric}"])))
+                (1 / float(pd.to_numeric(group["Demographic_group" == "National"][f"Count_{metric}"])))
                 for metric in INTERVENTION_TYPES
             ]) >= min_coverage * burden # coverage_g >= z * burden_g 
 
