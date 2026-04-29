@@ -552,15 +552,34 @@ class FairnessOptimizer:
         self.preferences = preferences
         self.model = pulp.LpProblem("Fairness_Allocation", pulp.LpMaximize)
         self.allocation_vars = {}
+        self.cost_map = {}
+
+    def _build_cost_map(self):
+        """Pre-compute cost mapping to avoid repeated DataFrame lookups."""
+        df = self.problem.filtered_df
+        for row in df.to_dict('records'):
+            iso3 = row["ISO3"]
+            demographic_group = row["Demographic_group"]
+            for itype in INTERVENTION_TYPES:
+                key = (iso3, demographic_group, itype)
+                self.cost_map[key] = float(pd.to_numeric(row[COST_COLS[itype]], errors="coerce"))
 
     def setup_variables(self):
-        data = self.problem.filtered_df
-        # data = data[:20] # TODO: ONLY AFGHANISTAN, TO REMOVE
-
-        for index, row in data.iterrows():
-            for idx, metric in enumerate(INTERVENTION_TYPES):
-                # self.allocation_vars[(index, row['ISO3'], row['Demographic_group'], metric)] = pulp.LpVariable(f"{row['ISO3']}_{row.at['Demographic_group']}_{metric}", lowBound=0, upBound=row.iloc[7 + idx] * row.iloc[10 + idx], cat='continuous')
-                self.allocation_vars[(index, row['ISO3'], row['Demographic_group'], metric)] = pulp.LpVariable(f"{row['ISO3']}_{row.at['Demographic_group']}_{metric}", lowBound=0, upBound=row.at[f"Count_{metric}"], cat='continuous')
+        """Create one LpVariable per (iso3, demographic_group, metric).
+        Key structure: (iso3, demographic_group, itype) → LpVariable
+        upBound = available children → encodes capacity without a separate constraint."""
+        df = self.problem.filtered_df
+        for row in df.to_dict('records'):
+            iso3 = row["ISO3"]
+            demographic_group = row["Demographic_group"]
+            for itype in INTERVENTION_TYPES:
+                key = (iso3, demographic_group, itype)
+                self.allocation_vars[key] = pulp.LpVariable(
+                    name=f"x_{iso3}_{demographic_group}_{itype}",
+                    lowBound=0,
+                    upBound=float(row[COUNT_COLS[itype]]),
+                    cat=pulp.LpContinuous,
+                )
 
     def add_max_min_fairness(self):
         """Maximize the minimum treated-share across all filtered rows.
@@ -575,7 +594,9 @@ class FairnessOptimizer:
         working_df = self.problem.filtered_df
         added_constraint = False
 
-        for idx, row in working_df.iterrows():
+        for iso3, demo in working_df[["ISO3", "Demographic_group"]].drop_duplicates().values:
+            row = working_df[(working_df["ISO3"] == iso3) & 
+                             (working_df["Demographic_group"] == demo)].iloc[0]
             row_need = sum(
                 float(pd.to_numeric(row[COUNT_COLS[metric]], errors="coerce") or 0.0)
                 for metric in INTERVENTION_TYPES
@@ -585,11 +606,11 @@ class FairnessOptimizer:
                 continue
 
             row_treated_expr = pulp.lpSum(
-                self.allocation_vars[(idx, row["ISO3"], row["Demographic_group"], metric)]
+                self.allocation_vars[(iso3, demo, metric)]
                 for metric in INTERVENTION_TYPES
             )
 
-            self.model += row_treated_expr >= min_coverage * row_need, f"Min_Coverage_{idx}"
+            self.model += row_treated_expr >= min_coverage * row_need, f"Min_Coverage_{iso3}_{demo}"
             added_constraint = True
 
         if not added_constraint:
@@ -600,8 +621,8 @@ class FairnessOptimizer:
     def add_proportional_fairness(self):
         # Keep utilitarian-style objective.
         self.model += pulp.lpSum(
-            self.allocation_vars[(idx, iso3, demo, metric)] * self.preferences.metric_weights[metric]
-            for (idx, iso3, demo, metric) in self.allocation_vars
+            self.allocation_vars[(iso3, demo, metric)] * self.preferences.metric_weights[metric]
+            for (iso3, demo, metric) in self.allocation_vars
         ), "Total_Treated_Children"
     
         # Build normalized country burden shares.
@@ -624,9 +645,8 @@ class FairnessOptimizer:
         # Country-specific minimum spend share.
         for iso3, burden_share in countries_burden.items():
             country_spend_expr = pulp.lpSum(
-                self.allocation_vars[(idx, var_iso3, demo, metric)] *
-                float(pd.to_numeric(self.problem.filtered_df.at[idx, COST_COLS[metric]], errors="coerce") or 0.0)
-                for (idx, var_iso3, demo, metric) in self.allocation_vars
+                self.allocation_vars[(var_iso3, demo, metric)] * self.cost_map[(var_iso3, demo, metric)]
+                for (var_iso3, demo, metric) in self.allocation_vars
                 if var_iso3 == iso3
             )
             self.model += country_spend_expr >= burden_share * self.problem.total_budget, f"Proportional_fairness_{iso3}"
@@ -660,7 +680,7 @@ class FairnessOptimizer:
 
             constrained_keys = [
                 key for key in self.allocation_vars
-                if group_value in str(key[2]).lower()
+                if group_value in str(key[1]).lower()
             ]
 
             # If no matching demographic rows exist, skip instead of creating impossible constraints.
@@ -668,9 +688,8 @@ class FairnessOptimizer:
                 continue
 
             spend_expr = pulp.lpSum(
-                self.allocation_vars[(idx, iso3, demo, metric)] *
-                float(pd.to_numeric(self.problem.df.at[idx, COST_COLS[metric]], errors="coerce") or 0.0)
-                for (idx, iso3, demo, metric) in constrained_keys
+                self.allocation_vars[(iso3, demo, metric)] * self.cost_map[(iso3, demo, metric)]
+                for (iso3, demo, metric) in constrained_keys
             )
 
             if bound_type == "min":
@@ -681,18 +700,17 @@ class FairnessOptimizer:
     def solve(self) -> Dict:
         """Dispatch by fairness mode and return solution payload."""
         self.setup_variables()
+        self._build_cost_map()  # Pre-compute costs before building constraints
 
         self.model += pulp.lpSum([
-            self.allocation_vars[(index, iso3, group, metric)] * 
-            float(pd.to_numeric(self.problem.filtered_df.at[index, f"Cost_{metric}"], errors="coerce"))
-            for (index, iso3, group, metric) in self.allocation_vars
+            self.allocation_vars[(iso3, group, metric)] * self.cost_map[(iso3, group, metric)]
+            for (iso3, group, metric) in self.allocation_vars
         ]) <= self.problem.total_budget, "Max_Budget"
 
         if self.preferences.fairness_mode == "utilitarian":
             self.model += pulp.lpSum([
-                self.allocation_vars[(index, iso3, group, metric)] * 
-                self.preferences.metric_weights[metric]
-                for (index, iso3, group, metric) in self.allocation_vars
+                self.allocation_vars[(iso3, group, metric)] * self.preferences.metric_weights[metric]
+                for (iso3, group, metric) in self.allocation_vars
             ]), "Total_Treated_Children"
         elif self.preferences.fairness_mode == "max-min":
             self.add_max_min_fairness()
@@ -716,7 +734,7 @@ class FairnessOptimizer:
         """
         df = self.problem.filtered_df.copy()
     
-        # Build quick lookup for Country and costs by (ISO3, Demographic_group, metric)
+        # Build quick lookup for Country by (ISO3, Demographic_group)
         country_lookup = (
             df[["ISO3", "Demographic_group", "Country"]]
             .drop_duplicates()
@@ -724,20 +742,11 @@ class FairnessOptimizer:
             .to_dict()
         )
     
-        cost_lookup = {}
-        for row in df.to_dict("records"):
-            iso3 = row["ISO3"]
-            demo = row["Demographic_group"]
-            for metric in INTERVENTION_TYPES:
-                cost_lookup[(iso3, demo, metric)] = float(
-                    pd.to_numeric(row[COST_COLS[metric]], errors="coerce")
-                )
-    
         # Aggregate variable values into row-level output
         records = {}
-        for (_, iso3, demo, metric), var in self.allocation_vars.items():
+        for (iso3, demo, metric), var in self.allocation_vars.items():
             treated = float(pulp.value(var) or 0.0)
-            cost = cost_lookup.get((iso3, demo, metric), 0.0)
+            cost = self.cost_map.get((iso3, demo, metric), 0.0)
             spend = treated * cost
     
             key = (iso3, demo)
@@ -1104,15 +1113,19 @@ class FairnessMetrics:
     @staticmethod
     def build_summary(allocation: Dict, problem: AllocationProblem, label: str = "solution") -> Dict[str, Any]:
         """Return a compact metric summary for one allocation result."""
+        total_treated = FairnessMetrics.total_lives_impacted(allocation, problem)
+        demographic_gap = FairnessMetrics.demographic_parity_violation(allocation, problem)
         return {
             "label": label,
             "status": allocation.get("status", "UNKNOWN"),
-            "total_lives_impacted": FairnessMetrics.total_lives_impacted(allocation, problem),
+            "total_treated": total_treated,
+            "total_lives_impacted": total_treated,
             "total_spend": float(allocation.get("total_spend", 0.0) or 0.0),
             "budget_utilisation_pct": float(allocation.get("budget_utilisation_pct", 0.0) or 0.0),
             "gini_coefficient": FairnessMetrics.gini_coefficient(allocation, problem),
             "max_min_ratio": FairnessMetrics.max_min_ratio(allocation, problem),
-            "demographic_parity_violation": FairnessMetrics.demographic_parity_violation(allocation, problem),
+            "demographic_coverage_gap": demographic_gap,
+            "demographic_parity_violation": demographic_gap,
             "proportionality_violation": FairnessMetrics.proportionality_violation(allocation, problem),
         }
 
@@ -1226,7 +1239,13 @@ class AllocationEngine:
     """
 
     def __init__(self, data_path: str, total_budget: float):
-        self.data = pd.read_csv(data_path)
+        # Convert relative path to absolute path based on script location
+        file_path = Path(data_path)
+        if not file_path.is_absolute():
+            # Remove leading ../ to get the relative path from project root
+            clean_path = data_path.lstrip("../").lstrip(".\\")
+            file_path = Path(__file__).parent.parent / clean_path
+        self.data = pd.read_csv(file_path)
         self.problem = AllocationProblem(df=self.data, total_budget=total_budget)
         self.results = {}
 

@@ -21,9 +21,9 @@ engine = AllocationEngine(
     total_budget=100_000_000,  # $100 million global budget
 )
 
-print("✓ Engine initialized")
+print("[OK] Engine initialized")
 solution = engine.run_baseline()
-print("✓ Baseline solution computed")
+print("[OK] Baseline solution computed")
 
 preferences = StakeholderPreferences(
     metric_weights={"stunting": 1.0, "wasting": 1.0, "severe_wasting": 1.5},
@@ -32,7 +32,7 @@ preferences = StakeholderPreferences(
 )
 
 solution_fair = engine.run_fairness(preferences=preferences)
-print("✓ Fairness-aware solution computed")
+print("[OK] Fairness-aware solution computed")
 
 # Multi-stakeholder profiles: clinical, equity, efficiency
 stakeholders = [
@@ -66,7 +66,7 @@ stakeholders = [
 ]
 
 sim_results = engine.run_fairness_simulations(stakeholders, include_consensus=True)
-print(f"✓ Ran {len(sim_results)} stakeholder simulations (including consensus)")
+print(f"[OK] Ran {len(sim_results)} stakeholder simulations (including consensus)")
 for (idx, res) in sim_results.items():
     print(f"\n--- Simulation: {idx} ---")
     print(f"Status            : {res['status']}")
@@ -92,10 +92,10 @@ consensus = sim_results.get("consensus")
 if consensus:
     consensus_eff = FairnessMetrics.total_lives_impacted(consensus, engine.problem)
     consensus_gini = FairnessMetrics.gini_coefficient(consensus, engine.problem)
-    print(f"✓ Consensus efficiency: {consensus_eff:,.0f} lives")
-    print(f"✓ Consensus gini: {consensus_gini:.3f}")
+    print(f"[OK] Consensus efficiency: {consensus_eff:,.0f} lives")
+    print(f"[OK] Consensus gini: {consensus_gini:.3f}")
 
 engine.compare_solutions()
-print("✓ Solutions compared on efficiency and equity metrics")
+print("[OK] Solutions compared on efficiency and equity metrics")
 engine.generate_pareto_frontier()
-print("✓ Pareto frontier generated to visualize trade-offs")
+print("[OK] Pareto frontier generated to visualize trade-offs")

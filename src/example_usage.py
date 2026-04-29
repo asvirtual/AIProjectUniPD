@@ -6,9 +6,11 @@ This script demonstrates the workflow:
   2. Define stakeholder preferences
   3. Run baseline utilitarian model
   4. Run fairness-aware model
-  5. Compare results
+  5. Compare results"
   6. Generate Pareto frontier
 """
+
+from pathlib import Path
 
 from optimization_engine import (
     AllocationEngine,
@@ -22,7 +24,8 @@ from optimization_engine import (
 # ============================================================================
 
 # Load the enriched dataset from data_cleaning.ipynb
-data_path = "../data/processed/master_df_with_counts_and_costs.csv"
+BASE_DIR = Path(__file__).resolve().parent
+data_path = str(BASE_DIR.parent / "data" / "processed" / "master_df_mece_compliant.csv")
 total_budget = 100_000_000  # $100 million global budget
 
 engine = AllocationEngine(data_path=data_path, total_budget=total_budget)
@@ -55,7 +58,7 @@ print("\n" + "="*70)
 print("FAIRNESS PREFERENCES: Stakeholder Definitions")
 print("="*70)
 
-# Example 1: Weight severe wasting higher, ensure rural minimum
+# Example 1: Weighted utilitarian fairness with rural minimum
 preferences_1 = PreferenceElicitor(
     metric_weights={
         'stunting': 1.0,
@@ -63,9 +66,9 @@ preferences_1 = PreferenceElicitor(
         'severe_wasting': 1.5  # Prioritize severe cases
     },
     demographic_constraints={
-        'Rural': 0.30  # At least 30% of budget to rural areas
+        'rural_min_share': 0.30  # At least 30% of budget to rural areas
     },
-    fairness_mode='weighted-log'  # Log-utility = diminishing returns
+    fairness_mode='utilitarian'
 )
 
 print("Preference Set 1 (Severe Wasting + Rural Protection):")
@@ -104,7 +107,7 @@ print("="*70)
 
 for i, pref in enumerate([preferences_1, preferences_2, preferences_3], 1):
     print(f"\n--- Solution {i}: {pref.fairness_mode.upper()} ---")
-    fair_solution = engine.run_fairness(pref)
+    fair_solution = engine.run_fairness(pref.to_preferences())
     
     efficiency = FairnessMetrics.total_lives_impacted(fair_solution, engine.problem)
     gini = FairnessMetrics.gini_coefficient(fair_solution, engine.problem)
@@ -135,7 +138,7 @@ print("\n" + "="*70)
 print("PARETO FRONTIER: Efficiency vs. Equity")
 print("="*70)
 
-output_plot = "../plots/pareto_frontier.png"
+output_plot = str(BASE_DIR.parent / "plots" / "pareto_frontier.png")
 engine.generate_pareto_frontier(filepath=output_plot)
 print(f"✓ Pareto frontier saved to {output_plot}")
 
