@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
 import pandas as pd
 import pulp
 
@@ -31,6 +32,12 @@ COST_COLS = {
     "severe_wasting": "Cost_severe_wasting",
 }
 
+# Scaling factor for improved numerical stability
+# Divides counts by 1000, budget by 1e6, costs by 1000 to maintain unit consistency
+COUNT_SCALE_FACTOR = 1000
+BUDGET_SCALE_FACTOR = 1e6
+COST_SCALE_FACTOR = 1000  # Costs must be scaled consistently: 1e6 / 1000 = 1000
+
 @dataclass
 class AllocationProblem:
     df: pd.DataFrame
@@ -41,6 +48,16 @@ class AllocationProblem:
 
     def __post_init__(self):
         df = self.df.copy()
+        # Scale counts and costs for numerical stability
+        for col in COUNT_COLS.values():
+            if col in df.columns:
+                df[col] = df[col] / COUNT_SCALE_FACTOR
+        for col in COST_COLS.values():
+            if col in df.columns:
+                df[col] = df[col] / COST_SCALE_FACTOR
+        # Scale budget
+        self.total_budget = self.total_budget / BUDGET_SCALE_FACTOR
+        
         if self.countries:
             df = df[df["ISO3"].isin(self.countries)]
         if self.demographic_filter:
@@ -55,7 +72,7 @@ class StakeholderPreferences:
 
     metric_weights: Dict[str, float]
     demographic_constraints: Dict[str, float]
-    fairness_mode: str  # utilitarian | max-min | proportional | weighted-log
+    fairness_mode: str  # utilitarian | max-min | proportional
 
 
 @dataclass
@@ -155,8 +172,10 @@ class UtilitarianOptimizer:
             for itype in INTERVENTION_TYPES:
                 key = (iso3, demographic_group, itype)
                 treated = pulp.value(self.allocation_vars[key]) or 0.0
-                record[f"treated_{itype}"] = treated
-                record[f"spend_{itype}"] = treated * self.cost_map[key]
+                # Unscale treated counts to original scale
+                record[f"treated_{itype}"] = treated * COUNT_SCALE_FACTOR
+                # Unscale spend: spend(scaled) * COUNT_SCALE_FACTOR * COST_SCALE_FACTOR
+                record[f"spend_{itype}"] = treated * self.cost_map[key] * COUNT_SCALE_FACTOR * COST_SCALE_FACTOR
             
             record["total_treated"] = sum(record[f"treated_{t}"] for t in INTERVENTION_TYPES)
             record["total_spend"] = sum(record[f"spend_{t}"] for t in INTERVENTION_TYPES)
@@ -164,13 +183,15 @@ class UtilitarianOptimizer:
 
         allocation_df = pd.DataFrame(rows)
         total_spend = allocation_df["total_spend"].sum()
+        # Unscale budget to original scale
+        original_budget = self.problem.total_budget * BUDGET_SCALE_FACTOR
 
         return {
             "status": pulp.LpStatus[self.model.status],
-            "total_treated": pulp.value(self.model.objective) or 0.0,
+            "total_treated": (pulp.value(self.model.objective) or 0.0) * COUNT_SCALE_FACTOR,
             "total_spend": total_spend,
-            "budget": self.problem.total_budget,
-            "budget_utilisation_pct": 100 * total_spend / self.problem.total_budget if self.problem.total_budget > 0 else 0,
+            "budget": original_budget,
+            "budget_utilisation_pct": 100 * total_spend / original_budget if original_budget > 0 else 0,
             "allocation_df": allocation_df,
         }
 
@@ -319,7 +340,6 @@ class PreferenceElicitor:
         q1_min_share = 0.20
     """
 
-    # ALLOWED_FAIRNESS_MODES = {"utilitarian", "weighted-log", "max-min", "proportional"}
     ALLOWED_FAIRNESS_MODES = {"utilitarian", "max-min", "proportional"}
 
     def __init__(
@@ -349,7 +369,7 @@ class PreferenceElicitor:
             "urban_max_share": 0.6,
             "female_min_share": 0.45
           },
-          "fairness_mode": "weighted-log"
+          "fairness_mode": "max-min"
         }
         """
         with open(filepath, "r", encoding="utf-8") as f:
@@ -746,8 +766,11 @@ class FairnessOptimizer:
         records = {}
         for (iso3, demo, metric), var in self.allocation_vars.items():
             treated = float(pulp.value(var) or 0.0)
+            # Unscale treated counts to original scale
+            treated_unscaled = treated * COUNT_SCALE_FACTOR
             cost = self.cost_map.get((iso3, demo, metric), 0.0)
-            spend = treated * cost
+            # Unscale spend: spend(scaled) * COUNT_SCALE_FACTOR * COST_SCALE_FACTOR
+            spend = treated * cost * COUNT_SCALE_FACTOR * COST_SCALE_FACTOR
     
             key = (iso3, demo)
             if key not in records:
@@ -762,9 +785,9 @@ class FairnessOptimizer:
                     records[key][f"treated_{t}"] = 0.0
                     records[key][f"spend_{t}"] = 0.0
     
-            records[key][f"treated_{metric}"] += treated
+            records[key][f"treated_{metric}"] += treated_unscaled
             records[key][f"spend_{metric}"] += spend
-            records[key]["total_treated"] += treated
+            records[key]["total_treated"] += treated_unscaled
             records[key]["total_spend"] += spend
     
         allocation_df = pd.DataFrame(list(records.values()))
@@ -779,16 +802,18 @@ class FairnessOptimizer:
             )
     
         total_spend = float(allocation_df["total_spend"].sum()) if not allocation_df.empty else 0.0
+        # Unscale budget to original scale
+        original_budget = float(self.problem.total_budget) * BUDGET_SCALE_FACTOR
 
         return {
             "status": pulp.LpStatus[self.model.status],
             "objective_value": float(pulp.value(self.model.objective) or 0.0),
             "total_treated": float(allocation_df["total_treated"].sum()) if not allocation_df.empty else 0.0,
             "total_spend": total_spend,
-            "budget": float(self.problem.total_budget),
+            "budget": original_budget,
             "budget_utilisation_pct": (
-                100.0 * total_spend / float(self.problem.total_budget)
-                if float(self.problem.total_budget) > 0 else 0.0
+                100.0 * total_spend / original_budget
+                if original_budget > 0 else 0.0
             ),
             "allocation_df": allocation_df,
         }
@@ -1215,18 +1240,91 @@ class ParetoBoundary:
         self.problem = problem
         self.frontier = []
 
-    def generate_solutions(
-        self,
-        fairness_modes: List[str],
-        budget_fractions: List[float] = [0.5, 0.75, 1.0],
-    ):
-        """TODO: run batches and store (efficiency, equity, mode, budget_frac)."""
-        pass
+    def generate_solutions(self, fairness_modes, budget_fractions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]):
 
-    def plot(self, filepath: Optional[str] = None):
-        """TODO: scatter-plot Pareto points and optionally save figure."""
-        pass
+        for mode in fairness_modes:
+            for frac in budget_fractions:
+                scaled_problem = AllocationProblem(
+                    df=self.problem.df,
+                    total_budget=self.problem.total_budget * frac
+                )
+                prefs = StakeholderPreferences(
+                    metric_weights={"stunting": 1.0, "wasting": 1.0, "severe_wasting": 1.0},
+                    demographic_constraints={},
+                    fairness_mode=mode
+                )
+                try:
+                    result = FairnessOptimizer(scaled_problem, prefs).solve()
+                    efficiency = FairnessMetrics.total_lives_impacted(result, scaled_problem)
+                    gini = FairnessMetrics.gini_coefficient(result, scaled_problem)
+                    
+                    # DEBUG: Check if efficiency is in scaled or unscaled units
+                    if mode == "utilitarian" and frac == 1.0:
+                        print(f"DEBUG {mode}@{frac}: result['total_treated']={result.get('total_treated', 'N/A')}, efficiency={efficiency}, efficiency/1e6={efficiency/1e6:.3f}M")
+                    
+                    self.frontier.append((efficiency, gini, mode, frac))
+                except Exception as e:
+                    print(f"Skipped {mode}@{frac}: {e}")
 
+    def plot(self, filepath=None):
+        
+        fig, ax = plt.subplots(figsize=(10, 7))
+        
+        colors = {"utilitarian": "#2196F3", "proportional": "#FF9800", "max-min": "#4CAF50"}
+        markers = {"utilitarian": "o", "proportional": "s", "max-min": "^"}
+        
+        # Group by mode
+        from collections import defaultdict
+        by_mode = defaultdict(list)
+        for (eff, gini, mode, frac) in self.frontier:
+            by_mode[mode].append((eff, gini, frac))
+        
+        # Debug: print efficiency values
+        if self.frontier:
+            sample_effs = [eff for eff, _, _, _ in self.frontier[:3]]
+            print(f"DEBUG: Sample efficiency values: {sample_effs}")
+            print(f"DEBUG: Min/Max efficiency: {min(eff for eff, _, _, _ in self.frontier)} - {max(eff for eff, _, _, _ in self.frontier)}")
+            print(f"DEBUG: All frontier data (first 3): {self.frontier[:3]}")
+        
+        # Apply formatter BEFORE plotting
+        # Efficiency values are already in millions, so just add 'M' suffix
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda x, _: f'{x:.1f}M'))
+        
+        for mode, points in by_mode.items():
+            # Sort by efficiency for line connection
+            points.sort(key=lambda p: p[0])
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            fracs = [p[2] for p in points]
+            
+            ax.plot(xs, ys, color=colors[mode], alpha=0.4, linewidth=1, linestyle="--")
+            
+            sc = ax.scatter(xs, ys, c=fracs, cmap="YlOrRd", 
+                            marker=markers[mode], s=80, 
+                            edgecolors=colors[mode], linewidths=1.5,
+                            label=mode, zorder=3)
+        
+        # Colorbar for budget fraction
+        cbar = plt.colorbar(sc, ax=ax)
+        cbar.set_label("Budget Fraction", fontsize=10)
+        
+        ax.set_xlabel("Total Lives Impacted (Efficiency)", fontsize=12)
+        ax.set_ylabel("Gini Coefficient (Inequality ↓ better)", fontsize=12)
+        ax.set_title("Pareto Frontier: Efficiency vs Equity Trade-off", fontsize=14)
+        
+        # Annotate ideal corner
+        ax.annotate("← Ideal region\n(high efficiency,\nlow inequality)", 
+                    xy=(0.98, 0.02), xycoords='axes fraction',
+                    ha='right', va='bottom', fontsize=9, color='gray',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', alpha=0.7))
+        
+        ax.legend(title="Fairness Mode", fontsize=10)
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        if filepath:
+            plt.savefig(filepath, dpi=150, bbox_inches="tight")
+        plt.show()
 
 # ============================================================================
 # 7. ORCHESTRATION
@@ -1377,5 +1475,5 @@ class AllocationEngine:
     def generate_pareto_frontier(self, filepath: Optional[str] = None):
         """Generate and plot Pareto front."""
         pareto = ParetoBoundary(self.problem)
-        pareto.generate_solutions(["utilitarian", "proportional", "weighted-log", "max-min"])
+        pareto.generate_solutions(["utilitarian", "proportional", "max-min"])
         pareto.plot(filepath=filepath)

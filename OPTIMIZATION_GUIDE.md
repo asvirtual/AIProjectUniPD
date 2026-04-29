@@ -75,7 +75,7 @@ Collects user preferences in a clean, validated way.
 {
   "metric_weights": {"stunting": 1.0, "severe_wasting": 1.5},
   "demographic_constraints": {"Rural": 0.30},
-  "fairness_mode": "weighted-log"
+  "fairness_mode": "proportional"
 }
 ```
 
@@ -84,21 +84,9 @@ Collects user preferences in a clean, validated way.
 ### 4. `FairnessOptimizer`
 
 **What it does:**
-Solves **four different fairness concepts** via different objectives/constraints.
+Solves **three different fairness concepts** via different objectives/constraints.
 
-#### 4a. **Weighted Log-Utility** (`weighted-log`)
-```
-Maximize: sum(w[i] * log(1 + x[i]))
-```
-- `w[i]` = metric weight (e.g., 1.5 for severe wasting)
-- `x[i]` = allocation to region i
-- `log()` encodes diminishing returns (first $ saves most lives, last $ saves fewer)
-
-**Implementation note:**
-- PuLP is LP-only → piecewise linear approximation, OR
-- Use `CVXPY` for native support of log (convex solver)
-
-#### 4b. **Max-Min Fairness** (`max-min`)
+#### 4a. **Max-Min Fairness** (`max-min`)
 ```
 Maximize: z
 Subject to: z <= (allocation[g] / burden[g]) for all groups g
@@ -106,7 +94,7 @@ Subject to: z <= (allocation[g] / burden[g]) for all groups g
 - Maxes the **minimum** coverage % across all demographic groups
 - Rawlsian: helps the worst-off
 
-#### 4c. **Proportional Fairness** (`proportional`)
+#### 4b. **Proportional Fairness** (`proportional`)
 ```
 Constraints: allocation[i] >= budget * (burden[i] / total_burden)
 ```
@@ -114,7 +102,6 @@ Constraints: allocation[i] >= budget * (burden[i] / total_burden)
 - Fair ≠ equal (per-capita doesn't matter, total burden does)
 
 **Implementation tasks:**
-- `add_weighted_log_objective()` – Decide: CVXPY or piecewise LP
 - `add_max_min_fairness()` – Introduce slack variable `z`, add constraints
 - `add_proportional_fairness()` – For each demographic group, calculate its burden share, enforce floor
 - `add_demographic_constraints()` – Layer on user's minimum allocations (e.g., "≥30% rural")
