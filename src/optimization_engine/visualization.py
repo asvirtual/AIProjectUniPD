@@ -20,7 +20,7 @@ class ParetoBoundary:
 
     def __init__(self, problem: AllocationProblem):
         self.problem = problem
-        self.frontier = []  # list of (efficiency, gini, mode_label, frac)
+        self.frontier = []  # list of (efficiency, gini, gini_count, mode_label, frac)
 
     def generate_solutions(
         self,
@@ -59,7 +59,8 @@ class ParetoBoundary:
                     result = FairnessOptimizer(scaled_problem, prefs).solve()
                     efficiency = FairnessMetrics.total_lives_impacted(result, scaled_problem)
                     gini = FairnessMetrics.gini_coefficient(result, scaled_problem)
-                    self.frontier.append((efficiency, gini, mode, frac))
+                    gini_count = FairnessMetrics.gini_count(result, scaled_problem)
+                    self.frontier.append((efficiency, gini, gini_count, mode, frac))
                 except Exception as e:
                     print(f"Skipped {mode}@{frac}: {e}")
 
@@ -82,13 +83,14 @@ class ParetoBoundary:
                         result = optimizer.solve()
                         efficiency = FairnessMetrics.total_lives_impacted(result, scaled_problem)
                         gini = FairnessMetrics.gini_coefficient(result, scaled_problem)
-                        self.frontier.append((efficiency, gini, label, frac))
+                        gini_count = FairnessMetrics.gini_count(result, scaled_problem)
+                        self.frontier.append((efficiency, gini, gini_count, label, frac))
                     except Exception as e:
                         print(f"Skipped {label}@{frac}: {e}")
 
     def plot(self, filepath=None):
 
-        fig, ax = plt.subplots(figsize=(12, 7))
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 7))
 
         # Style maps — constrained entries keyed by their label
         base_colors  = {"utilitarian": "#2196F3", "proportional": "#FF9800", "max-min": "#4CAF50"}
@@ -102,7 +104,7 @@ class ParetoBoundary:
         colors  = dict(base_colors)
         markers = dict(base_markers)
         extra_idx = 0
-        for (_, _, mode, _) in self.frontier:
+        for (_, _, _, mode, _) in self.frontier:
             if mode not in colors:
                 colors[mode]  = extra_colors[extra_idx % len(extra_colors)]
                 markers[mode] = extra_markers[extra_idx % len(extra_markers)]
@@ -110,45 +112,84 @@ class ParetoBoundary:
 
         # Group points by mode
         by_mode = defaultdict(list)
-        for (eff, gini, mode, frac) in self.frontier:
-            by_mode[mode].append((eff, gini, frac))
+        for (eff, gini, gini_count, mode, frac) in self.frontier:
+            by_mode[mode].append((eff, gini, gini_count, frac))
 
-        ax.xaxis.set_major_formatter(FuncFormatter(lambda x, _: f'{x/1e6:.1f}M'))
+        # ─── Panel 1: Efficiency vs Gini Coefficient ──────────────────
+        ax1.xaxis.set_major_formatter(FuncFormatter(lambda x, _: f'{x/1e6:.1f}M'))
 
-        scatter_obj = None
+        scatter_obj1 = None
         for mode, points in by_mode.items():
             points.sort(key=lambda p: p[0])
             xs    = [p[0] for p in points]
             ys    = [p[1] for p in points]
-            fracs = [p[2] for p in points]
+            fracs = [p[3] for p in points]
 
-            ax.plot(xs, ys, color=colors[mode], alpha=0.4, linewidth=1, linestyle="--")
-            scatter_obj = ax.scatter(
+            ax1.plot(xs, ys, color=colors[mode], alpha=0.4, linewidth=1, linestyle="--")
+            scatter_obj1 = ax1.scatter(
                 xs, ys,
                 c=fracs, cmap="YlOrRd",
                 marker=markers[mode], s=80,
                 edgecolors=colors[mode], linewidths=1.5,
                 label=mode, zorder=3,
-                vmin=0.1, vmax=1.0,   # consistent colorbar scale across all series
+                vmin=0.1, vmax=1.0,
             )
 
-        if scatter_obj is not None:
-            cbar = plt.colorbar(scatter_obj, ax=ax)
-            cbar.set_label("Budget Fraction", fontsize=10)
+        if scatter_obj1 is not None:
+            cbar1 = plt.colorbar(scatter_obj1, ax=ax1)
+            cbar1.set_label("Budget Fraction", fontsize=10)
 
-        ax.set_xlabel("Total Lives Impacted (Efficiency)", fontsize=12)
-        ax.set_ylabel("Gini Coefficient (Inequality ↓ better)", fontsize=12)
-        ax.set_title("Pareto Frontier: Efficiency vs Equity Trade-off", fontsize=14)
+        ax1.set_xlabel("Total Lives Impacted (Efficiency)", fontsize=12)
+        ax1.set_ylabel("Gini Coefficient (Inequality ↓ better)", fontsize=12)
+        ax1.set_title("Pareto Frontier: Efficiency vs Gini Coefficient", fontsize=13)
 
-        ax.annotate(
+        ax1.annotate(
             "← Ideal region\n(high efficiency,\nlow inequality)",
             xy=(0.98, 0.02), xycoords='axes fraction',
             ha='right', va='bottom', fontsize=9, color='gray',
             bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', alpha=0.7),
         )
 
-        ax.legend(title="Fairness Mode", fontsize=10)
-        ax.grid(True, alpha=0.3)
+        ax1.legend(title="Fairness Mode", fontsize=10)
+        ax1.grid(True, alpha=0.3)
+
+        # ─── Panel 2: Efficiency vs Gini Count ──────────────────────────
+        ax2.xaxis.set_major_formatter(FuncFormatter(lambda x, _: f'{x/1e6:.1f}M'))
+
+        scatter_obj2 = None
+        for mode, points in by_mode.items():
+            points.sort(key=lambda p: p[0])
+            xs    = [p[0] for p in points]
+            ys    = [p[2] for p in points]  # gini_count
+            fracs = [p[3] for p in points]
+
+            ax2.plot(xs, ys, color=colors[mode], alpha=0.4, linewidth=1, linestyle="--")
+            scatter_obj2 = ax2.scatter(
+                xs, ys,
+                c=fracs, cmap="YlOrRd",
+                marker=markers[mode], s=80,
+                edgecolors=colors[mode], linewidths=1.5,
+                label=mode, zorder=3,
+                vmin=0.1, vmax=1.0,
+            )
+
+        if scatter_obj2 is not None:
+            cbar2 = plt.colorbar(scatter_obj2, ax=ax2)
+            cbar2.set_label("Budget Fraction", fontsize=10)
+
+        ax2.set_xlabel("Total Lives Impacted (Efficiency)", fontsize=12)
+        ax2.set_ylabel("Gini Count (Population inequality ↓ better)", fontsize=12)
+        ax2.set_title("Pareto Frontier: Efficiency vs Gini Count", fontsize=13)
+
+        ax2.annotate(
+            "← Ideal region\n(high efficiency,\nlow inequality)",
+            xy=(0.98, 0.02), xycoords='axes fraction',
+            ha='right', va='bottom', fontsize=9, color='gray',
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', alpha=0.7),
+        )
+
+        ax2.legend(title="Fairness Mode", fontsize=10)
+        ax2.grid(True, alpha=0.3)
 
         plt.tight_layout()
         if filepath:

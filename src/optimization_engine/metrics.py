@@ -134,6 +134,26 @@ class FairnessMetrics:
         """Inequality of achieved coverage across rows (0 = perfectly equal coverage)."""
         merged = FairnessMetrics._merged_allocation_view(allocation, problem)
         return float(FairnessMetrics._gini(merged["coverage_ratio"].tolist()))
+    
+    # Measure inequality in absolute treated counts across rows.
+    # Input: allocation result dict.
+    # Output: Gini coefficient on raw total_treated values.
+    # Purpose: captures absolute distributional inequality, not just coverage rate equality.
+    @staticmethod
+    def gini_count(allocation: Dict, problem: AllocationProblem) -> float:
+        """Inequality of absolute treated counts across rows (0 = perfectly equal counts).
+
+        Distinct from gini_coefficient, which operates on coverage_ratio = treated/need.
+        A solution can have gini_coefficient=0 (uniform coverage rate) while gini_count
+        is high (large strata receive many more children in absolute terms than small ones).
+        The two metrics together reveal whether fairness is achieved in rate or in volume.
+        """
+        allocation_df = FairnessMetrics._allocation_df(allocation)
+        if "total_treated" not in allocation_df.columns:
+            raise ValueError("allocation_df must contain a 'total_treated' column.")
+        values = pd.to_numeric(allocation_df["total_treated"], errors="coerce").fillna(0.0).tolist()
+        return float(FairnessMetrics._gini(values))
+
 
     # Compare the best-served and worst-served groups in terms of coverage.
     # Input: allocation result dict + AllocationProblem.
@@ -345,6 +365,7 @@ class FairnessMetrics:
             "total_spend": float(allocation.get("total_spend", 0.0) or 0.0),
             "budget_utilisation_pct": float(allocation.get("budget_utilisation_pct", 0.0) or 0.0),
             "gini_coefficient": FairnessMetrics.gini_coefficient(allocation, problem),
+            "gini_count": FairnessMetrics.gini_count(allocation, problem),
             "max_min_ratio": FairnessMetrics.max_min_ratio(allocation, problem),
             "demographic_coverage_gap": demographic_gap,
             "demographic_parity_violation": demographic_gap,
@@ -380,6 +401,7 @@ class FairnessMetrics:
                     "total_spend",
                     # "budget_utilisation_pct",
                     "gini_coefficient",
+                    "gini_count",
                     "max_min_ratio",
                     "proportionality_violation",
                 ],
@@ -388,6 +410,7 @@ class FairnessMetrics:
                     baseline_summary["total_spend"],
                     # baseline_summary["budget_utilisation_pct"],
                     baseline_summary["gini_coefficient"],
+                    baseline_summary["gini_count"],
                     baseline_summary["max_min_ratio"],
                     baseline_summary["proportionality_violation"],
                 ],
@@ -396,6 +419,7 @@ class FairnessMetrics:
                     fairness_summary["total_spend"],
                     # fairness_summary["budget_utilisation_pct"],
                     fairness_summary["gini_coefficient"],
+                    fairness_summary["gini_count"],
                     fairness_summary["max_min_ratio"],
                     fairness_summary["proportionality_violation"],
                 ],

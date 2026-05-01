@@ -50,7 +50,7 @@ constrained_summary = FairnessMetrics.build_summary(solution_constrained, engine
 print("\n--- Metrics Comparison: Baseline vs Constrained ---")
 print(f"{'Metric':<30} {'Baseline':>15} {'Constrained':>15} {'Δ':>10}")
 print("-" * 70)
-for metric in ["total_lives_impacted", "gini_coefficient", "max_min_ratio", "proportionality_violation"]:
+for metric in ["total_lives_impacted", "gini_coefficient", "gini_count", "max_min_ratio", "proportionality_violation"]:
     baseline_val = baseline_summary.get(metric, 0)
     constrained_val = constrained_summary.get(metric, 0)
     delta = constrained_val - baseline_val if isinstance(baseline_val, (int, float)) else "N/A"
@@ -123,8 +123,10 @@ consensus = sim_results.get("consensus")
 if consensus:
     consensus_eff = FairnessMetrics.total_lives_impacted(consensus, engine.problem)
     consensus_gini = FairnessMetrics.gini_coefficient(consensus, engine.problem)
+    consensus_gini_count = FairnessMetrics.gini_count(consensus, engine.problem)
     print(f"[OK] Consensus efficiency: {consensus_eff:,.0f} lives")
     print(f"[OK] Consensus gini: {consensus_gini:.3f}")
+    print(f"[OK] Consensus gini_count: {consensus_gini_count:.0f}")
 
 engine.compare_solutions()
 print("[OK] Solutions compared on efficiency and equity metrics")
