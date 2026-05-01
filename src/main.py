@@ -25,6 +25,37 @@ print("[OK] Engine initialized")
 solution = engine.run_baseline()
 print("[OK] Baseline solution computed")
 
+solution_constrained = engine.run_constraint_baseline(constraints={"country_cap": 0.1})
+print("[OK] Constrained baseline solution computed")
+
+print("\n=== CONSTRAINED UTILITARIAN RESULTS ===")
+print(f"Status            : {solution_constrained['status']}")
+print(f"Total treated     : {solution_constrained['total_treated']:,.0f}")
+print(f"Total spend       : ${solution_constrained['total_spend']:,.0f}")
+print(f"Budget utilisation: {solution_constrained['budget_utilisation_pct']:.1f}%")
+
+print("\n--- Summary by Country ---")
+by_country_constrained = solution_constrained["allocation_df"].groupby("Country").agg({
+    "total_treated": "sum",
+    "total_spend": "sum"
+}).reset_index()
+by_country_constrained["pct_spend"] = 100 * by_country_constrained["total_spend"] / solution_constrained["total_spend"]
+by_country_constrained["cost_per_child"] = by_country_constrained["total_spend"] / by_country_constrained["total_treated"]
+by_country_constrained = by_country_constrained.sort_values("total_spend", ascending=False)
+print(by_country_constrained[["Country", "total_treated", "total_spend", "pct_spend", "cost_per_child"]].head(10).to_string(index=False))
+
+# Compare constrained vs baseline
+baseline_summary = FairnessMetrics.build_summary(solution, engine.problem, label="Baseline")
+constrained_summary = FairnessMetrics.build_summary(solution_constrained, engine.problem, label="Constrained")
+print("\n--- Metrics Comparison: Baseline vs Constrained ---")
+print(f"{'Metric':<30} {'Baseline':>15} {'Constrained':>15} {'Δ':>10}")
+print("-" * 70)
+for metric in ["total_lives_impacted", "gini_coefficient", "max_min_ratio", "proportionality_violation"]:
+    baseline_val = baseline_summary.get(metric, 0)
+    constrained_val = constrained_summary.get(metric, 0)
+    delta = constrained_val - baseline_val if isinstance(baseline_val, (int, float)) else "N/A"
+    print(f"{metric:<30} {baseline_val:>15.2f} {constrained_val:>15.2f} {delta:>10.2f}")
+
 preferences = StakeholderPreferences(
     metric_weights={"stunting": 1.0, "wasting": 1.0, "severe_wasting": 1.5},
     demographic_constraints={"rural_min_share": 0.2},

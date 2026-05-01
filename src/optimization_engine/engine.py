@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from .models import AllocationProblem, StakeholderPreferences, StakeholderProfile
-from .solvers import UtilitarianOptimizer, FairnessOptimizer
+from .solvers import ConstrainedUtilitarianOptimizer, UtilitarianOptimizer, FairnessOptimizer
 from .metrics import FairnessMetrics
 from .visualization import ParetoBoundary
 
@@ -38,6 +38,19 @@ class AllocationEngine:
         baseline = optimizer.solve()
         self.results["baseline"] = baseline
         return baseline
+    
+    def run_constraint_baseline(self, constraints: Optional[Dict[str, Any]] = None) -> Dict:
+        """Run constrained utilitarian optimization (e.g. with per-country budget cap)."""
+        constraints = constraints or {}
+        optimizer = ConstrainedUtilitarianOptimizer(
+            self.problem,
+            country_cap=constraints.get("country_cap", 0.5),
+            demographic_cap=constraints.get("demographic_cap", None),
+            demographic_min_share=constraints.get("demographic_min_share", {}),
+        )
+        constrained_baseline = optimizer.solve()
+        self.results["constrained_baseline"] = constrained_baseline
+        return constrained_baseline
 
     def run_fairness(self, preferences: StakeholderPreferences) -> Dict:
         """Run fairness-aware optimization for one preference profile."""
@@ -157,8 +170,12 @@ class AllocationEngine:
         self.results["comparison"] = comparison
         return comparison
 
-    def generate_pareto_frontier(self, filepath: Optional[str] = None):
-        """Generate and plot Pareto front."""
+    def generate_pareto_frontier(self, filepath=None):
         pareto = ParetoBoundary(self.problem)
-        pareto.generate_solutions(["utilitarian", "proportional", "max-min"])
+        pareto.generate_solutions(
+            fairness_modes=["utilitarian", "proportional", "max-min"],
+            constrained_configs=[
+                {"label": "constrained\n(10% cap)", "country_cap": 0.10},
+            ],
+        )
         pareto.plot(filepath=filepath)
