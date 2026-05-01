@@ -9,6 +9,7 @@ venv/
 
 # Ignore OS generated files
 .DS_Store
+.vscode/
 
 # Test script
 src/test.py
