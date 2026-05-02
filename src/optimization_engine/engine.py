@@ -2,6 +2,7 @@
 # Allocation Engine: integrates data processing, preference elicitation, optimization, and evaluation
 # ============================================================================
 
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -228,6 +229,13 @@ class AllocationEngine:
         return comparison
 
     def generate_pareto_frontier(self, filepath=None):
+        # Auto-generate filepath if not provided
+        if filepath is None:
+            output_dir = Path(__file__).parent.parent.parent / "outputs"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filepath = str(output_dir / f"pareto_frontier_{timestamp}.png")
+        
         constrained_cfgs = []
         if self._last_constraint_baseline_constraints:
             country_cap = self._last_constraint_baseline_constraints.get("country_cap", 0.5)
@@ -249,3 +257,4 @@ class AllocationEngine:
             constrained_configs=constrained_cfgs,
         )
         pareto.plot(filepath=filepath)
+        print(f"[OK] Pareto frontier saved to {filepath}")
