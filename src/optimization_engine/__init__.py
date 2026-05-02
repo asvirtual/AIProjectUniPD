@@ -6,5 +6,5 @@ __all__ = [
     "AllocationEngine",
     "StakeholderProfile",
     "StakeholderPreferences",
-    "FairnessMetrics"
+    "FairnessMetrics",
 ]

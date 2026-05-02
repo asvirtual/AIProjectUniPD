@@ -43,10 +43,12 @@ class PreferenceElicitor:
         metric_weights: Dict[str, float],
         demographic_constraints: Optional[Dict[str, float]] = None,
         fairness_mode: str = "utilitarian",
+        min_coverage_share: Optional[float] = None,
     ):
         self.metric_weights = metric_weights
         self.demographic_constraints = demographic_constraints or {}
         self.fairness_mode = fairness_mode
+        self.min_coverage_share = min_coverage_share
 
     @staticmethod
     def from_json(filepath: str) -> "PreferenceElicitor":
@@ -78,6 +80,7 @@ class PreferenceElicitor:
             metric_weights=payload.get("metric_weights", {}),
             demographic_constraints=payload.get("demographic_constraints", {}),
             fairness_mode=payload.get("fairness_mode", "utilitarian"),
+            min_coverage_share=payload.get("min_coverage_share", None),
         )
 
     @staticmethod
@@ -186,6 +189,12 @@ class PreferenceElicitor:
                     f"min_share ({bounds['min']}) cannot exceed max_share ({bounds['max']})."
                 )
 
+        if self.min_coverage_share is not None:
+            if not self._is_number(self.min_coverage_share):
+                raise ValueError("min_coverage_share must be numeric when provided.")
+            if not 0 <= float(self.min_coverage_share) <= 1:
+                raise ValueError("min_coverage_share must be between 0 and 1.")
+
         return True
 
     def normalized_metric_weights(self) -> Dict[str, float]:
@@ -246,4 +255,9 @@ class PreferenceElicitor:
                 key: float(value) for key, value in self.demographic_constraints.items()
             },
             fairness_mode=self.fairness_mode,
+            min_coverage_share=(
+                float(self.min_coverage_share)
+                if self.min_coverage_share is not None
+                else None
+            ),
         )

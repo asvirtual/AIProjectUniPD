@@ -18,7 +18,7 @@ Steps:
 
 engine = AllocationEngine(
     data_path="../data/processed/master_df_mece_compliant.csv",
-    total_budget=100_000_000,  # $100 million global budget
+    total_budget=500_000_000,  # $100 million global budget
 )
 
 print("[OK] Engine initialized")
@@ -83,6 +83,7 @@ stakeholders = [
             metric_weights={"stunting": 1.0, "wasting": 1.0, "severe_wasting": 1.2},
             demographic_constraints={"rural_min_share": 0.4},
             fairness_mode="max-min",
+            min_coverage_share=0.01,
         ),
     ),
     StakeholderProfile(
@@ -127,6 +128,9 @@ if consensus:
     print(f"[OK] Consensus efficiency: {consensus_eff:,.0f} lives")
     print(f"[OK] Consensus gini: {consensus_gini:.3f}")
     print(f"[OK] Consensus gini_count: {consensus_gini_count:.0f}")
+    print(f"[OK] Efficiency ceiling   : {consensus.get('efficiency_ceiling', 0):,.0f}  |  floor: {consensus.get('efficiency_floor', 0):,.0f}  ({consensus.get('efficiency_tolerance', 0)*100:.0f}% tolerance)")
+    if not consensus.get('demographic_constraints_applied', True):
+        print("[WARN] Demographic constraints were relaxed — efficiency floor + constraints were jointly infeasible")
 
 engine.compare_solutions()
 print("[OK] Solutions compared on efficiency and equity metrics")

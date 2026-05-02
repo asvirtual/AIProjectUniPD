@@ -19,6 +19,44 @@ from .models import (
 )
 
 
+def _solve_with_fallback(
+    model: pulp.LpProblem,
+    primary_solver,
+    fallback_solver=None,
+) -> None:
+    """Solve a PuLP model with a deterministic fallback solver.
+
+    This shields the optimization flow from environment-specific solver issues
+    (for example HiGHS_CMD output parsing errors on some local installs).
+    """
+    solvers_to_try = [primary_solver]
+    if fallback_solver is not None:
+        solvers_to_try.append(fallback_solver)
+
+    last_error = None
+
+    for solver in solvers_to_try:
+        available_method = getattr(solver, "available", None)
+        if callable(available_method):
+            try:
+                if not solver.available():
+                    continue
+            except Exception:
+                # If availability probing fails, try solving anyway.
+                pass
+
+        try:
+            model.solve(solver)
+            return
+        except Exception as exc:
+            last_error = exc
+
+    if last_error is not None:
+        raise last_error
+
+    model.solve()
+
+
 #=======================================================================
 # Standard Utilitarian Optimizer
 #=======================================================================
@@ -89,7 +127,11 @@ class UtilitarianOptimizer:
         self.add_objective()
         self.add_budget_constraint()
         
-        self.model.solve(pulp.HiGHS_CMD(msg=False))
+        _solve_with_fallback(
+            self.model,
+            primary_solver=pulp.HiGHS_CMD(msg=False),
+            fallback_solver=pulp.PULP_CBC_CMD(msg=False),
+        )
 
         return self._extract_solution()
 
@@ -237,8 +279,11 @@ class ConstrainedUtilitarianOptimizer(UtilitarianOptimizer):
         self.add_demographic_budget_caps()
         self.add_demographic_minimum_constraints()
         
-        # Solve using HiGHS solver
-        self.model.solve(pulp.HiGHS_CMD(msg=False))
+        _solve_with_fallback(
+            self.model,
+            primary_solver=pulp.HiGHS_CMD(msg=False),
+            fallback_solver=pulp.PULP_CBC_CMD(msg=False),
+        )
         
         return self._extract_solution()
 
@@ -406,6 +451,46 @@ class FairnessOptimizer:
             else:
                 self.model += spend_expr <= float(value) * self.problem.total_budget
 
+    def add_coverage_floor(self):
+        """Apply a per-stratum minimum treated-share floor when requested.
+
+        Preference key:
+            min_coverage_share (float in [0, 1])
+
+        Semantics:
+            For each (ISO3, Demographic_group) with positive need,
+            treated_in_stratum >= min_coverage_share * need_in_stratum.
+        """
+        min_coverage_share = self.preferences.min_coverage_share
+        if min_coverage_share is None:
+            return
+
+        min_coverage_share = float(min_coverage_share)
+        if min_coverage_share <= 0:
+            return
+
+        working_df = self.problem.filtered_df
+        for iso3, demo in working_df[["ISO3", "Demographic_group"]].drop_duplicates().values:
+            row = working_df[
+                (working_df["ISO3"] == iso3) & (working_df["Demographic_group"] == demo)
+            ].iloc[0]
+            row_need = sum(
+                float(pd.to_numeric(row[COUNT_COLS[metric]], errors="coerce") or 0.0)
+                for metric in INTERVENTION_TYPES
+            )
+
+            if row_need <= 0:
+                continue
+
+            row_treated_expr = pulp.lpSum(
+                self.allocation_vars[(iso3, demo, metric)]
+                for metric in INTERVENTION_TYPES
+            )
+            self.model += (
+                row_treated_expr >= min_coverage_share * row_need,
+                f"Coverage_Floor_{iso3}_{demo}",
+            )
+
     def solve(self) -> Dict:
         """Dispatch by fairness mode and return solution payload."""
         self.setup_variables()
@@ -427,12 +512,18 @@ class FairnessOptimizer:
             self.add_proportional_fairness()
 
         self.add_demographic_constraints()
+        self.add_coverage_floor()
         solver = (
             pulp.PULP_CBC_CMD(msg=False)
             if self.preferences.fairness_mode == "max-min"
             else pulp.HiGHS_CMD(msg=False)
         )
-        self.model.solve(solver)
+        fallback_solver = (
+            pulp.HiGHS_CMD(msg=False)
+            if self.preferences.fairness_mode == "max-min"
+            else pulp.PULP_CBC_CMD(msg=False)
+        )
+        _solve_with_fallback(self.model, primary_solver=solver, fallback_solver=fallback_solver)
         return self._extract_solution()
 
     def _extract_solution(self) -> Dict:
@@ -506,3 +597,151 @@ class FairnessOptimizer:
             ),
             "allocation_df": allocation_df,
         }
+
+# ========================================================================
+# Lexicographic Consensus Optimizer
+# ========================================================================
+
+class LexicographicConsensusOptimizer:
+    """
+    Two-stage lexicographic optimizer for multi-stakeholder consensus.
+
+    Stage 1 — efficiency ceiling:
+        Run a plain UtilitarianOptimizer to find E*, the maximum number of
+        children treatable within budget.
+
+    Stage 2 — fairness within tolerance:
+        Run FairnessOptimizer with the blended consensus preferences, but add
+        a hard lower bound: total_treated >= (1 - tolerance) * E*.
+
+    This guarantees the consensus solution is never worse than
+    (1 - tolerance) of the utilitarian ceiling, regardless of how
+    conflicting the blended preferences are.
+
+    Args:
+        problem     : AllocationProblem instance.
+        preferences : StakeholderPreferences produced by aggregate_preferences.
+        efficiency_tolerance: maximum acceptable efficiency loss as a fraction
+            of E*. Default 0.05 = allow up to 5% fewer children treated in
+            exchange for improved fairness.
+    """
+
+    def __init__(
+        self,
+        problem: AllocationProblem,
+        preferences: StakeholderPreferences,
+        efficiency_tolerance: float = 0.05,
+    ):
+        if not (0.0 <= efficiency_tolerance < 1.0):
+            raise ValueError("efficiency_tolerance must be in [0, 1).")
+        self.problem = problem
+        self.preferences = preferences
+        self.efficiency_tolerance = efficiency_tolerance
+
+    def _build_stage2(
+        self,
+        efficiency_floor: float,
+        include_demographic_constraints: bool,
+    ) -> "FairnessOptimizer":
+        """
+        Construct and return a configured FairnessOptimizer for stage 2.
+        Kept separate so we can retry without demographic constraints on infeasibility.
+        """
+        fairness_opt = FairnessOptimizer(self.problem, self.preferences)
+        fairness_opt.setup_variables()
+        fairness_opt._build_cost_map()
+
+        # Budget constraint
+        fairness_opt.model += pulp.lpSum([
+            fairness_opt.allocation_vars[k] * fairness_opt.cost_map[k]
+            for k in fairness_opt.allocation_vars
+        ]) <= fairness_opt.problem.total_budget, "Max_Budget"
+
+        # Efficiency floor — scale back to solver units
+        floor_scaled = efficiency_floor / COUNT_SCALE_FACTOR
+        fairness_opt.model += pulp.lpSum([
+            fairness_opt.allocation_vars[k]
+            for k in fairness_opt.allocation_vars
+        ]) >= floor_scaled, "Efficiency_Floor"
+
+        # Fairness objective
+        if self.preferences.fairness_mode == "utilitarian":
+            fairness_opt.model += pulp.lpSum([
+                fairness_opt.allocation_vars[(iso3, group, metric)]
+                * self.preferences.metric_weights[metric]
+                for (iso3, group, metric) in fairness_opt.allocation_vars
+            ]), "Weighted_Treated"
+        elif self.preferences.fairness_mode == "max-min":
+            fairness_opt.add_max_min_fairness()
+        elif self.preferences.fairness_mode == "proportional":
+            fairness_opt.add_proportional_fairness()
+
+        fairness_opt.add_coverage_floor()
+
+        if include_demographic_constraints:
+            fairness_opt.add_demographic_constraints()
+
+        return fairness_opt
+    
+    def solve(self) -> Dict:
+        """
+        Run both stages and return the stage-2 solution with ceiling metadata.
+
+        Fallback strategy: if stage 2 is infeasible with demographic constraints
+        (e.g. rural_min_share conflicts with the efficiency floor at new costs),
+        retry without them and attach a warning to the result so callers know
+        which constraints were relaxed.
+        """
+        # ------------------------------------------------------------------
+        # Stage 1: utilitarian ceiling
+        # ------------------------------------------------------------------
+        stage1 = UtilitarianOptimizer(self.problem).solve()
+        efficiency_ceiling = float(stage1.get("total_treated", 0.0))
+        efficiency_floor   = efficiency_ceiling * (1.0 - self.efficiency_tolerance)
+
+        solver = (
+            pulp.PULP_CBC_CMD(msg=False)
+            if self.preferences.fairness_mode == "max-min"
+            else pulp.HiGHS_CMD(msg=False)
+        )
+        fallback_solver = (
+            pulp.HiGHS_CMD(msg=False)
+            if self.preferences.fairness_mode == "max-min"
+            else pulp.PULP_CBC_CMD(msg=False)
+        )
+
+        # ------------------------------------------------------------------
+        # Stage 2a: with demographic constraints
+        # ------------------------------------------------------------------
+        fairness_opt = self._build_stage2(efficiency_floor, include_demographic_constraints=True)
+        _solve_with_fallback(
+            fairness_opt.model,
+            primary_solver=solver,
+            fallback_solver=fallback_solver,
+        )
+        demographic_constraints_applied = True
+
+        # ------------------------------------------------------------------
+        # Stage 2b: fallback — relax demographic constraints if infeasible
+        # ------------------------------------------------------------------
+        if pulp.LpStatus[fairness_opt.model.status] != "Optimal":
+            print(
+                f"[WARN] Consensus infeasible with demographic constraints "
+                f"(mode={self.preferences.fairness_mode}, "
+                f"tolerance={self.efficiency_tolerance}). "
+                f"Retrying without demographic constraints."
+            )
+            fairness_opt = self._build_stage2(efficiency_floor, include_demographic_constraints=False)
+            _solve_with_fallback(
+                fairness_opt.model,
+                primary_solver=solver,
+                fallback_solver=fallback_solver,
+            )
+            demographic_constraints_applied = False
+
+        result = fairness_opt._extract_solution()
+        result["efficiency_ceiling"]              = efficiency_ceiling
+        result["efficiency_floor"]                = efficiency_floor
+        result["efficiency_tolerance"]            = self.efficiency_tolerance
+        result["demographic_constraints_applied"] = demographic_constraints_applied
+        return result

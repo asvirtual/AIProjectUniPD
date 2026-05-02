@@ -73,6 +73,7 @@ class StakeholderPreferences:
     metric_weights: Dict[str, float]
     demographic_constraints: Dict[str, float]
     fairness_mode: str  # utilitarian | max-min | proportional
+    min_coverage_share: Optional[float] = None
 
 
 @dataclass
